@@ -30,7 +30,7 @@
     "react-dom": "^19.1.0",
     "react-hot-toast": "^2.6.1",
     "react-markdown": "^10.1.0",
-    "recharts": "^3.8.0",
+    "recharts": "^3.10.1",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "shiki": "^4.5.0",
