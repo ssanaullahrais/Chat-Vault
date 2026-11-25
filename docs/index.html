@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChatVault – Read, search and back up every AI coding chat on your PC</title>
+  <meta name="description" content="ChatVault is a free, open source Windows app that finds every Claude Code, Codex, Cursor, Gemini CLI, OpenCode and Cline chat on your PC so you can read, search, back up, export and continue them. Local only and private." />
+  <link rel="canonical" href="https://ssanaullahrais.github.io/Chat-Vault/" />
+  <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="author" content="Sanaullah Rais" />
+
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="assets/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="assets/icon-256.png" />
+
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="ChatVault" />
+  <meta property="og:title" content="ChatVault – every AI coding chat on your PC, in one place" />
+  <meta property="og:description" content="Read, search, back up and continue your Claude Code, Codex, Cursor, Gemini CLI, OpenCode and Cline chats. Free, open source and local only." />
+  <meta property="og:url" content="https://ssanaullahrais.github.io/Chat-Vault/" />
+  <meta property="og:image" content="https://ssanaullahrais.github.io/Chat-Vault/screenshots/01-home.png" />
+  <meta property="og:image:width" content="2880" />
+  <meta property="og:image:height" content="1800" />
+  <meta property="og:image:alt" content="The ChatVault home screen with recent chats from every tool" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="ChatVault – every AI coding chat on your PC, in one place" />
+  <meta name="twitter:description" content="Read, search, back up and continue your AI coding chats. Free, open source and local only." />
+  <meta name="twitter:image" content="https://ssanaullahrais.github.io/Chat-Vault/screenshots/01-home.png" />
+
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("theme"); } catch (e) {}
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" />
+  <link rel="stylesheet" href="assets/site.css?v=2" />
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "ChatVault",
+    "operatingSystem": "Windows 10, Windows 11",
+    "applicationCategory": "DeveloperApplication",
+    "description": "A free, open source desktop app to read, search, back up and continue AI coding chats from Claude Code, Codex, Cursor, Gemini CLI, OpenCode and Cline. Everything stays on your PC.",
+    "url": "https://ssanaullahrais.github.io/Chat-Vault/",
+    "downloadUrl": "https://github.com/ssanaullahrais/Chat-Vault/releases/latest",
+    "image": "https://ssanaullahrais.github.io/Chat-Vault/assets/icon-1024.png",
+    "license": "https://opensource.org/licenses/MIT",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "author": { "@type": "Person", "name": "Sanaullah Rais", "url": "https://github.com/ssanaullahrais" }
+  }
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="./" aria-label="ChatVault home">
+        <img src="assets/favicon.svg" alt="" width="28" height="28" />
+        <span>ChatVault</span>
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a class="link hide-sm" href="#features">Features</a>
+        <a class="link hide-sm" href="#tools">Supported tools</a>
+        <a class="link hide-sm" href="#privacy">Privacy</a>
+        <a class="link" href="https://github.com/ssanaullahrais/Chat-Vault" rel="noopener" aria-label="ChatVault on GitHub">GitHub</a>
+        <button class="icon-btn" id="theme-toggle" type="button" aria-label="Switch between light and dark theme">
+          <svg class="theme-icon-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+          <svg class="theme-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap">
+        <img class="hero-icon" src="assets/icon-256.png" alt="ChatVault app icon" width="72" height="72" />
+        <div class="eyebrow"><span class="dot" aria-hidden="true"></span> Free and open source for Windows 10 and 11</div>
+        <h1>Every AI coding chat on your PC, in one place.</h1>
+        <p class="lead">ChatVault is a small desktop app that finds the chats Claude Code, Codex, Cursor, Gemini CLI, OpenCode and Cline already keep on your computer, from every account you have used, so you can read them, search them, back them up and pick the work up again in any tool.</p>
+        <div class="btn-row stack-sm">
+          <a class="btn btn-primary btn-lg" href="https://github.com/ssanaullahrais/Chat-Vault/releases/latest" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+            Download for Windows
+          </a>
+          <a class="btn btn-lg" href="https://github.com/ssanaullahrais/Chat-Vault" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.53-1.33-1.29-1.69-1.29-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>
+            View on GitHub
+          </a>
+          <a class="btn btn-lg" href="https://github.com/ssanaullahrais/Chat-Vault/stargazers" rel="noopener" aria-label="Star ChatVault on GitHub">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.8l2.8 5.7 6.3.9-4.6 4.4 1.1 6.2L12 17l-5.6 3 1.1-6.2L2.9 9.4l6.3-.9z"/></svg>
+            Star <span class="count" data-gh-stars hidden></span>
+          </a>
+        </div>
+        <p class="hero-meta"><span>About 4 MB</span><span>MIT licence</span><span>No account needed</span></p>
+
+        <div class="shot">
+          <img src="screenshots/01-home.png" width="2880" height="1800" alt="ChatVault home screen showing activity, storage and recent chats across every tool, with sample data" fetchpriority="high" />
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="what">
+      <div class="wrap">
+        <div class="split">
+          <div>
+            <h2>Your chats are still on your computer. ChatVault shows them.</h2>
+            <p class="muted">AI coding tools save every conversation on your PC, but each one only shows the chats of the account that is signed in right now. Sign out, switch accounts or reinstall, and your history seems to vanish, even though the files are still there.</p>
+            <p class="muted">ChatVault reads those files, lists them in one fast window and keeps a private search index on your PC. It never uploads your chats and needs no sign-in.</p>
+          </div>
+          <ul class="checklist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>Free and open source.</b> MIT licence, built in the open on GitHub. No subscription, no ads, no tracking.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>Lightweight.</b> An installer of about 4 MB that uses the WebView2 runtime already in Windows.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>Private by design.</b> Your chats, index and backups stay on your PC. The only connection it makes is a check with GitHub for a new version.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>Read only by default.</b> It reads your chat files and never touches the sign-in files of your tools.</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Everything you need to keep your AI chats</h2>
+          <p>Read, find, keep and reuse every conversation, whichever tool or account it came from.</p>
+        </div>
+        <div class="grid">
+          <div class="card">
+            <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <h3>Read every chat</h3>
+            <p>Open any conversation with its messages, plans, tool steps, code and tables, from every account you have ever signed in with.</p>
+          </div>
+          <div class="card">
+            <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></div>
+            <h3>Search all tools at once</h3>
+            <p>Full-text search across every tool with <kbd>Ctrl</kbd> + <kbd>K</kbd>, and find inside the open chat with <kbd>Ctrl</kbd> + <kbd>F</kbd>.</p>
+          </div>
+          <div class="card">
+            <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div>
+            <h3>Back up and restore</h3>
+            <p>Copy your chats to a backup folder you choose, back up automatically, and restore missing chats without overwriting anything.</p>
+          </div>
+          <div class="card">
+            <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+            <h3>Continue in any tool</h3>
+            <p>Hand a chat off to another tool. A handoff file carries the whole conversation, so the next tool starts where you stopped.</p>
+          </div>
+          <div class="card">
+            <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 15h6"/></svg></div>
+            <h3>Export</h3>
+            <p>Save any chat as Markdown, HTML, plain text or JSON to share it, archive it or keep it in your notes.</p>
+          </div>
+          <div class="card">
+            <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M3 12h3M18 12h3M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg></div>
+            <h3>Automatic updates</h3>
+            <p>New versions download in the background from GitHub, are checked against a signature, and install when you restart.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="tools">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Works with the tools you already use</h2>
+          <p>Switch each tool on or off in Settings and see exactly which folder its chats are read from.</p>
+        </div>
+        <div class="tools">
+          <div class="tool"><span class="tool-mark" style="background:#D97757" aria-hidden="true">Cl</span><div><b>Claude Code</b><small>CLI and desktop app sessions</small></div></div>
+          <div class="tool"><span class="tool-mark" style="background:linear-gradient(135deg,#b1a7ff,#3941ff)" aria-hidden="true">Cx</span><div><b>Codex</b><small>Sessions and archived sessions</small></div></div>
+          <div class="tool"><span class="tool-mark" style="background:#27272a" aria-hidden="true">Cu</span><div><b>Cursor</b><small>Agent and editor chats</small></div></div>
+          <div class="tool"><span class="tool-mark" style="background:linear-gradient(135deg,#4f8cf7,#a463f2)" aria-hidden="true">Ge</span><div><b>Gemini CLI</b><small>Saved project chats</small></div></div>
+          <div class="tool"><span class="tool-mark" style="background:#52525b" aria-hidden="true">Oc</span><div><b>OpenCode</b><small>Local session database</small></div></div>
+          <div class="tool"><span class="tool-mark" style="background:#7c3aed" aria-hidden="true">Cn</span><div><b>Cline</b><small>VS Code extension and CLI tasks</small></div></div>
+        </div>
+        <p class="muted" style="font-size:13px;margin-top:16px">ChatVault is an independent project and is not affiliated with Anthropic, OpenAI, Anysphere, Google, Cline or OpenCode. Product names belong to their owners.</p>
+      </div>
+    </section>
+
+    <section class="block" id="screens">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>A closer look</h2>
+          <p>All screenshots use sample data.</p>
+        </div>
+        <div class="gallery">
+          <figure class="wide">
+            <div class="frame"><img src="screenshots/02-chat.png" width="2880" height="1800" loading="lazy" alt="A chat open in ChatVault with its plan, tool steps, a table and code, with sample data" /></div>
+            <figcaption><b>Read.</b> Plans, tool steps, tables and code, laid out like the original tool.</figcaption>
+          </figure>
+          <figure>
+            <div class="frame"><img src="screenshots/03-search-all-tools.png" width="2880" height="1800" loading="lazy" alt="Search across Claude, Codex, Gemini CLI, Cursor Agent, OpenCode and Cline at once, with sample data" /></div>
+            <figcaption><b>Search.</b> One search across every tool at once.</figcaption>
+          </figure>
+          <figure>
+            <div class="frame"><img src="screenshots/05-sync-backup.png" width="2880" height="1800" loading="lazy" alt="Sync and backup screen: choose the backup folder, sync now, restore missing chats and back up automatically, with sample data" /></div>
+            <figcaption><b>Back up.</b> Choose the folder, sync now or automatically, and restore missing chats.</figcaption>
+          </figure>
+          <figure class="wide">
+            <div class="frame"><img src="screenshots/04-settings.png" width="2880" height="1800" loading="lazy" alt="Settings: switch each tool on or off and see where its chats are read from, with sample data" /></div>
+            <figcaption><b>Stay in control.</b> Switch each tool on or off and see exactly where its chats come from.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="privacy">
+      <div class="wrap">
+        <div class="split">
+          <div>
+            <h2>Private by default</h2>
+            <p class="muted">Your conversations can hold source code, file paths and secrets. ChatVault treats them that way: it works on your PC, with no account and no server of ours in between.</p>
+            <p><a class="btn btn-sm" href="privacy.html">Read the Privacy Policy</a></p>
+          </div>
+          <ul class="checklist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>No uploads.</b> Chats, the search index and backups never leave your computer.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>No analytics or ads.</b> ChatVault does not track how you use it.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>One network call.</b> A check with GitHub for a new version, and the download if there is one.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>Optional cloud backup, later.</b> A Google Drive backup is planned. It will be off until you connect it, and it will only touch the backup files ChatVault creates in your own Drive.</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="block download" id="download">
+      <div class="wrap">
+        <div class="card">
+          <img class="hero-icon" src="assets/icon-256.png" alt="" width="72" height="72" style="margin-bottom:20px" />
+          <h2>Get ChatVault</h2>
+          <p class="muted" style="margin:0">Free for Windows 10 and 11 (64-bit). Updates install themselves.<span data-gh-version-wrap> Latest version: <span data-gh-version>see Releases</span>.</span></p>
+          <div class="btn-row stack-sm">
+            <a class="btn btn-primary btn-lg" href="https://github.com/ssanaullahrais/Chat-Vault/releases/latest" rel="noopener">Download the latest release</a>
+            <a class="btn btn-lg" href="https://github.com/ssanaullahrais/Chat-Vault" rel="noopener">Source code</a>
+          </div>
+          <div class="files">
+            <div><span><code>…_x64-setup.exe</code></span><span>Normal installer (recommended)</span></div>
+            <div><span><code>…_x64_en-US.msi</code></span><span>Windows Installer or Group Policy</span></div>
+            <div><span><code>…_x64-portable.exe</code></span><span>Run without installing</span></div>
+          </div>
+          <p class="muted" style="font-size:13px;margin:20px 0 0">Until code signing is approved, Windows may show an “unknown publisher” warning. Updates carry their own signature that the app checks before installing.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>© <span id="year">2026</span> Sanaullah Rais · ChatVault</span>
+      <nav aria-label="Footer">
+        <a href="privacy.html">Privacy Policy</a>
+        <a href="terms.html">Terms of Service</a>
+        <a href="https://github.com/ssanaullahrais/Chat-Vault" rel="noopener">GitHub</a>
+        <a href="https://github.com/ssanaullahrais/Chat-Vault/issues" rel="noopener">Support</a>
+        <a href="https://github.com/ssanaullahrais/Chat-Vault/blob/main/LICENSE" rel="noopener">MIT Licence</a>
+      </nav>
+      <p class="fine">ChatVault is an independent project and is not affiliated with, endorsed by or sponsored by Anthropic, OpenAI, Anysphere (Cursor), Google, Cline or OpenCode.</p>
+    </div>
+  </footer>
+  <script src="assets/site.js?v=2" defer></script>
+</body>
+</html>

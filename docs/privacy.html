@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy – ChatVault</title>
+  <meta name="description" content="How the ChatVault desktop app handles your data: chats are read and indexed only on your PC, the only network use today is the GitHub update check, and how the planned optional Google Drive backup will use Google user data." />
+  <link rel="canonical" href="https://ssanaullahrais.github.io/Chat-Vault/privacy.html" />
+  <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+  <meta name="color-scheme" content="light dark" />
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="assets/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="assets/icon-256.png" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="ChatVault" />
+  <meta property="og:title" content="ChatVault Privacy Policy" />
+  <meta property="og:description" content="Your chats stay on your PC. How ChatVault handles your data, and how the planned Google Drive backup will work." />
+  <meta property="og:url" content="https://ssanaullahrais.github.io/Chat-Vault/privacy.html" />
+  <meta property="og:image" content="https://ssanaullahrais.github.io/Chat-Vault/assets/icon-1024.png" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="ChatVault Privacy Policy" />
+  <meta name="twitter:description" content="Your chats stay on your PC. How ChatVault handles your data." />
+  <meta name="twitter:image" content="https://ssanaullahrais.github.io/Chat-Vault/assets/icon-1024.png" />
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("theme"); } catch (e) {}
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" />
+  <link rel="stylesheet" href="assets/site.css?v=2" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="./" aria-label="ChatVault home">
+        <img src="assets/favicon.svg" alt="" width="28" height="28" />
+        <span>ChatVault</span>
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a class="link hide-sm" href="./">Home</a>
+        <a class="link hide-sm" href="terms.html">Terms</a>
+        <a class="link" href="https://github.com/ssanaullahrais/Chat-Vault" rel="noopener">GitHub</a>
+        <button class="icon-btn" id="theme-toggle" type="button" aria-label="Switch between light and dark theme">
+          <svg class="theme-icon-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+          <svg class="theme-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc">
+    <div class="wrap narrow">
+      <h1>Privacy Policy</h1>
+      <p class="updated">Last updated November 25, 2026 · Applies to the ChatVault desktop application for Windows and to this website.</p>
+
+      <div class="summary">
+        <h2>The short version</h2>
+        <ul>
+          <li>ChatVault runs on your computer. It reads the chat files your AI coding tools already keep there and builds a search index <strong>on your computer only</strong>.</li>
+          <li>It has no accounts, no analytics, no advertising and no server of ours. <strong>We never receive your chats</strong> or any other personal data.</li>
+          <li>Today, the only network connection the app makes is to <strong>GitHub</strong>, to check for and download updates.</li>
+          <li>An <strong>optional Google Drive backup</strong> is planned but <strong>not yet available</strong>. When it ships, it will be off until you connect it, will only access the files ChatVault itself creates in your Drive, and will send data only between your PC and your own Google Drive.</li>
+        </ul>
+      </div>
+
+      <h2 id="contents">Contents</h2>
+      <ol class="toc">
+        <li><a href="#who">Who we are</a></li>
+        <li><a href="#reads">Data ChatVault reads</a></li>
+        <li><a href="#stores">Data ChatVault creates and stores</a></li>
+        <li><a href="#processing">How your conversations are processed</a></li>
+        <li><a href="#network">Network connections</a></li>
+        <li><a href="#third">Third-party AI tools</a></li>
+        <li><a href="#drive">Google Drive backup (planned)</a></li>
+        <li><a href="#limited-use">Google API Services User Data Policy</a></li>
+        <li><a href="#sharing">Sharing and selling</a></li>
+        <li><a href="#security">Security</a></li>
+        <li><a href="#retention">Retention and deletion</a></li>
+        <li><a href="#rights">Your choices and rights</a></li>
+        <li><a href="#website">This website</a></li>
+        <li><a href="#children">Children</a></li>
+        <li><a href="#changes">Changes</a></li>
+        <li><a href="#contact">Contact</a></li>
+      </ol>
+
+      <h2 id="who">1. Who we are</h2>
+      <p>ChatVault is a free, open source (MIT licence) desktop application developed and maintained by Sanaullah Rais (“we”, “us”). The source code is public at <a href="https://github.com/ssanaullahrais/Chat-Vault" rel="noopener">github.com/ssanaullahrais/Chat-Vault</a>, so anyone can check that the app does what this policy says. ChatVault is independent and is not affiliated with Anthropic, OpenAI, Anysphere (Cursor), Google, Cline or OpenCode.</p>
+
+      <h2 id="reads">2. Data ChatVault reads <span class="tag tag-now">Current</span></h2>
+      <p>To show your conversations, ChatVault reads the files and local databases in which the following tools save their chats on your computer. You can switch each tool off in Settings, and the app then stops reading it.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tool</th><th>Typical location read (on your PC)</th></tr></thead>
+          <tbody>
+            <tr><td>Claude Code</td><td><code>%USERPROFILE%\.claude\projects</code> (or <code>CLAUDE_CONFIG_DIR</code>) and session details in <code>%APPDATA%\Claude</code></td></tr>
+            <tr><td>Codex</td><td><code>%USERPROFILE%\.codex</code> (or <code>CODEX_HOME</code>): sessions, archived sessions and the thread list</td></tr>
+            <tr><td>Cursor</td><td><code>%USERPROFILE%\.cursor\projects</code> and Cursor's chat storage in <code>%APPDATA%\Cursor\User</code></td></tr>
+            <tr><td>Gemini CLI</td><td><code>%USERPROFILE%\.gemini\tmp</code></td></tr>
+            <tr><td>OpenCode</td><td><code>%USERPROFILE%\.local\share\opencode</code></td></tr>
+            <tr><td>Cline</td><td>The Cline extension's task folder in VS Code's storage, and <code>%USERPROFILE%\.cline\data\sessions</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>These conversations can contain anything you or the tools put in them, including source code, file paths, names, credentials and other confidential or personal information.</p>
+      <p>To label chats by account, ChatVault also reads the <strong>email address</strong> (and no other entry) that Claude Code, Cursor and Gemini CLI record locally for the signed-in account. It <strong>never reads, copies or uses the sign-in tokens or passwords</strong> of these tools. The email is only shown to you inside the app.</p>
+
+      <h2 id="stores">3. Data ChatVault creates and stores <span class="tag tag-now">Current</span></h2>
+      <ul>
+        <li><strong>Search index:</strong> chat titles, dates, folders and searchable text, in <code>%LOCALAPPDATA%\ChatVault\index.db</code>, together with small settings files in the same folder (which tools are switched on, and where your backup folder is).</li>
+        <li><strong>Backup folder:</strong> when you run a backup or turn on automatic backup, copies of your chat files are placed in <code>Documents\ChatVault Backup</code>, or another folder you choose.</li>
+        <li><strong>Handoff files:</strong> when you continue a chat in another tool, a file holding that conversation is written to <code>Documents\ChatVault Handoffs</code>.</li>
+        <li><strong>Exports:</strong> Markdown, HTML, text, JSON or image files you choose to save, in the place you choose.</li>
+      </ul>
+      <p>All of these stay on your computer (or on a drive you choose). They are not encrypted by ChatVault, so anyone with access to your Windows account or those folders can read them.</p>
+
+      <h2 id="processing">4. How your conversations are processed</h2>
+      <p>All reading, indexing, searching, displaying, exporting and backing up happens <strong>locally on your computer</strong>. ChatVault does not send your conversations, index, backups or handoff files to us or to any server, does not analyse them for advertising, and does not use them to train any artificial intelligence or machine learning model.</p>
+      <p>ChatVault changes your tools' files only when you ask it to: restoring a backup adds missing chat files back (it never overwrites an existing file), and deleting a chat moves its file to the Windows Recycle Bin.</p>
+
+      <h2 id="network">5. Network connections <span class="tag tag-now">Current</span></h2>
+      <p>The current version of ChatVault makes one kind of network connection: it contacts <strong>GitHub</strong> (<code>github.com</code> and GitHub's download servers) to check whether a newer release exists and, if so, to download it. The update is verified against a signature before it is installed. Like any internet request, this reveals your IP address and basic technical details of the request to GitHub, which handles them under the <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement" rel="noopener">GitHub Privacy Statement</a>. No chat content or personal data is sent.</p>
+      <p>Links you click in the app (for example to documentation or this website) open in your web browser, which then follows its own privacy settings.</p>
+
+      <h2 id="third">6. Third-party AI tools</h2>
+      <p>If you use <em>Continue</em>, <em>Fork</em> or <em>Hand off</em>, ChatVault writes the conversation to a handoff file and starts the AI tool you picked on your computer. That tool may send the content to its provider (for example Anthropic, OpenAI or Google) under its own terms and privacy policy. ChatVault does not control what those tools do.</p>
+
+      <h2 id="drive">7. Google Drive backup <span class="tag tag-planned">Planned, not yet available</span></h2>
+      <div class="notice"><p><strong>This feature does not exist in any released version of ChatVault yet.</strong> This section describes how it will work so that you, and Google's review, know in advance. If the final design differs, this policy will be updated before the feature is released.</p></div>
+      <h3>What it will do</h3>
+      <p>An optional setting will let you back up your ChatVault backup folder to <strong>your own Google Drive</strong> and restore it from there, for example on a new PC. It will be off by default and nothing will be sent to Google until you choose <em>Connect Google Drive</em> and approve access on Google's own sign-in page.</p>
+      <h3>Google data it will access</h3>
+      <ul>
+        <li><strong><code>https://www.googleapis.com/auth/drive.file</code></strong> – lets ChatVault create, read, update and delete <strong>only the files and folders that ChatVault itself creates</strong> in your Drive (or that you explicitly open with it). It cannot see or change any of your other Drive files.</li>
+        <li><strong>Basic account identity</strong> (<code>openid</code> and <code>email</code>) – only to show which Google account is connected, so you can tell accounts apart. ChatVault will not request your contacts, calendar, Gmail or any other Google data.</li>
+      </ul>
+      <h3>How the data will be used</h3>
+      <ul>
+        <li>Backup files are uploaded <strong>directly from your PC to your Google Drive</strong> over an encrypted HTTPS connection, into a folder named “ChatVault Backup”. There is no ChatVault server in between, and we never receive a copy.</li>
+        <li>Files read from your Drive are used only to restore chats to your PC when you ask for it, and to compare what is already backed up so unchanged files are not uploaded again.</li>
+        <li>Your Google email address is shown in ChatVault's settings and kept on your PC. It is not sent anywhere else.</li>
+      </ul>
+      <h3>How sign-in tokens will be stored and protected</h3>
+      <ul>
+        <li>Sign-in uses Google's standard OAuth 2.0 flow for desktop apps, in your own web browser, with PKCE. ChatVault never sees your Google password.</li>
+        <li>The access and refresh tokens Google issues are stored <strong>only on your PC</strong>, in the Windows Credential Manager, which encrypts them with your Windows sign-in. They are never written to the search index, the backup folder, logs or exports, and never sent to us.</li>
+        <li>Tokens are sent only to Google's own servers (<code>*.googleapis.com</code> and <code>oauth2.googleapis.com</code>) to call the Drive API.</li>
+      </ul>
+      <h3>Disconnecting, revoking access and deleting backups</h3>
+      <ul>
+        <li><strong>In ChatVault:</strong> <em>Disconnect Google Drive</em> will revoke the token with Google and delete it from your PC.</li>
+        <li><strong>In your Google Account:</strong> you can remove ChatVault's access at any time at <a href="https://myaccount.google.com/connections" rel="noopener">myaccount.google.com/connections</a>. ChatVault then loses access immediately.</li>
+        <li><strong>Deleting backups:</strong> disconnecting does not delete your files from Drive, so your backup stays yours. To delete it, remove the “ChatVault Backup” folder in Google Drive (and empty the Drive trash). ChatVault will also offer to delete its Drive backup for you before disconnecting.</li>
+      </ul>
+
+      <h2 id="limited-use">8. Google API Services User Data Policy</h2>
+      <p>ChatVault's use and transfer to any other app of information received from Google APIs will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noopener">Google API Services User Data Policy</a>, including the Limited Use requirements. In particular:</p>
+      <ul>
+        <li>Google user data is used <strong>only to provide the Google Drive backup and restore feature</strong> that you turn on and that is visible in ChatVault's interface.</li>
+        <li>Google user data is <strong>not transferred</strong> to anyone, except as needed to provide that feature at your request, to comply with applicable law, or for security purposes.</li>
+        <li>Google user data is <strong>not used for advertising</strong>, including personalised or retargeted advertising, and is <strong>not sold</strong> or given to data brokers or information resellers.</li>
+        <li>Google user data is <strong>not used to determine credit-worthiness</strong> or for lending purposes.</li>
+        <li><strong>No person reads</strong> your Google user data. All processing happens automatically on your own PC, and we have no access to it. The only exception would be if you yourself send us content (for example in a support request) and ask us to look at it.</li>
+        <li>Google user data, including Drive files, is <strong>not used to develop, improve or train</strong> any generalised or non-personalised artificial intelligence or machine learning model.</li>
+      </ul>
+
+      <h2 id="sharing">9. Sharing and selling</h2>
+      <p>We do not collect your personal data, so we have nothing to share or sell. We do not sell, rent or trade any information, and ChatVault contains no third-party analytics, advertising or tracking code.</p>
+
+      <h2 id="security">10. Security</h2>
+      <ul>
+        <li>ChatVault's network connections (GitHub updates, and the planned Google Drive backup) use HTTPS.</li>
+        <li>Updates are signed, and the app refuses an update whose signature does not match.</li>
+        <li>The app's interface runs under a strict content security policy that blocks it from loading remote code or contacting other servers.</li>
+        <li>The source code is public, and security problems can be reported privately through <a href="https://github.com/ssanaullahrais/Chat-Vault/security/advisories/new" rel="noopener">GitHub security advisories</a>.</li>
+      </ul>
+      <p>Local files that ChatVault creates (index, backup, handoffs, exports) are as safe as your Windows account and disk. Use a strong Windows password and disk encryption such as BitLocker if your chats contain sensitive information.</p>
+
+      <h2 id="retention">11. Retention and deletion</h2>
+      <ul>
+        <li>We keep <strong>no data about you</strong> on any server, so there is nothing for us to retain or delete.</li>
+        <li>Local data stays until you delete it. You can delete <code>%LOCALAPPDATA%\ChatVault</code>, the backup folder, <code>Documents\ChatVault Handoffs</code> and any exports at any time. Uninstalling ChatVault does not remove your backup, handoff or export files, so that you do not lose them by accident.</li>
+        <li>For the planned Google Drive backup: tokens are deleted from your PC when you disconnect; backup files in your Drive stay until you delete them, as described in <a href="#drive">section 7</a>.</li>
+      </ul>
+
+      <h2 id="rights">12. Your choices and rights</h2>
+      <p>Because your data stays on your devices and in your own accounts, you control it directly: you can switch off any tool, choose or move the backup folder, delete any file ChatVault creates, and (once available) connect or disconnect Google Drive at any time. Depending on where you live, you may have legal rights to access or delete personal data; since we hold none, these are exercised by managing your own files. You can contact us with any question (see <a href="#contact">Contact</a>).</p>
+
+      <h2 id="website">13. This website</h2>
+      <p>This website is hosted by GitHub Pages, which may log visitors' IP addresses for security under GitHub's privacy statement. It loads fonts from Google Fonts, and the home page reads the public star count and latest version from GitHub's public API. The site sets no cookies and uses no analytics; your light or dark theme choice is saved only in your browser.</p>
+
+      <h2 id="children">14. Children</h2>
+      <p>ChatVault is a developer tool and is not directed at children under 13 (or the minimum age in your country). We do not knowingly collect information from anyone.</p>
+
+      <h2 id="changes">15. Changes to this policy</h2>
+      <p>We will update this page when ChatVault's handling of data changes, including before the Google Drive backup is released, and change the date at the top. Significant changes will also be mentioned in the release notes on GitHub. The history of this page is public in the repository.</p>
+
+      <h2 id="contact">16. Contact</h2>
+      <p>Developer: Sanaullah Rais.<br />
+      Questions about privacy: open an issue at <a href="https://github.com/ssanaullahrais/Chat-Vault/issues" rel="noopener">github.com/ssanaullahrais/Chat-Vault/issues</a>.<br />
+      Security problems or anything private: report it privately through <a href="https://github.com/ssanaullahrais/Chat-Vault/security/advisories/new" rel="noopener">GitHub security advisories</a>.</p>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>© <span id="year">2026</span> Sanaullah Rais · ChatVault</span>
+      <nav aria-label="Footer">
+        <a href="./">Home</a>
+        <a href="privacy.html" aria-current="page">Privacy Policy</a>
+        <a href="terms.html">Terms of Service</a>
+        <a href="https://github.com/ssanaullahrais/Chat-Vault" rel="noopener">GitHub</a>
+      </nav>
+    </div>
+  </footer>
+  <script src="assets/site.js?v=2" defer></script>
+</body>
+</html>
