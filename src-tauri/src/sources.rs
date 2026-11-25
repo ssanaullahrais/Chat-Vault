@@ -88,7 +88,6 @@ pub fn all(count_all: bool) -> Vec<Source> {
     }
     out.push(Source { provider: "codex".into(), name: "Codex".into(), enabled: on("codex"), locations: codex });
 
-    let count = count_all && on("cursor");
     let mut cursor = Vec::new();
     for (label, p, items) in crate::cursor::locations() {
         cursor.push(if p.is_file() { file(&label, &p, items) } else { dir(&label, &p, items) });

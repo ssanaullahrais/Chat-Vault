@@ -160,7 +160,7 @@ that build.
 7. Unit tests: `cd src-tauri && cargo test --lib gdrive::` (PKCE, state check, path safety, merge rules).
 
 **Release build**
-1. Add the two secrets, push a test tag (for example `v0.6.0-rc1`) or run the workflow manually.
+1. Add the two secrets, set the version in the package and Tauri configuration before pushing the matching release tag.
 2. Install the built setup on a clean PC and repeat steps 2 to 6.
 
 ## 9. Publish for everyone

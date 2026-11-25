@@ -9,13 +9,26 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-windows:
+    if: github.ref_type == 'tag'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Verify the release version
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match application version $version."
+          }
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
@@ -30,66 +43,80 @@ jobs:
 
       - run: npm ci
 
-      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+      - name: Build and sign Windows installers
+        run: npm run tauri -- build --ci
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Google Drive backup: the "Desktop app" OAuth client, built into the app by src-tauri/build.rs.
-          # Stored as repository secrets (see docs/GOOGLE_DRIVE_SETUP.md); GitHub masks them in the logs. If they are
-          # missing the release still builds, without Google Drive.
+          # Optional desktop OAuth client for Google Drive backups.
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "ChatVault ${{ github.ref_name }}"
-          releaseBody: |
-            ## ChatVault ${{ github.ref_name }}
 
-            Read, search, back up and continue your Claude Code, Codex, Cursor, Gemini CLI, OpenCode and Cline chats.
-
-            **Download**
-            - `ChatVault_*_x64-setup.exe`: the installer (recommended)
-            - `ChatVault_*_x64_en-US.msi`: Windows Installer package
-            - `ChatVault_*_x64-portable.exe`: runs without installing
-
-            Installed copies of ChatVault update themselves from this release.
-          releaseDraft: false
-          prerelease: false
-
-      # The release notes: this version's section of CHANGELOG.md, followed by the download list.
-      - name: Write the release notes from CHANGELOG.md
+      - name: Publish the complete Windows release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = $env:GITHUB_REF_NAME
+          $repo = $env:GITHUB_REPOSITORY
+          $version = $tag.Substring(1)
+          $msi = "ChatVault_${version}_x64_en-US.msi"
+          $setup = "ChatVault_${version}_x64-setup.exe"
+          $portable = "ChatVault_${version}_x64-portable.exe"
+          $release = 'src-tauri/target/release'
+          $msiPath = "$release/bundle/msi/$msi"
+          $setupPath = "$release/bundle/nsis/$setup"
+          Copy-Item "$release/chatvault.exe" $portable
+
           $lines = Get-Content CHANGELOG.md
           $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]" | Select-Object -First 1).LineNumber
-          if (-not $start) { Write-Host "No CHANGELOG.md section for $version; keeping the default notes."; exit 0 }
-          $notes = @()
-          for ($i = $start; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^## ') { break }
-            $notes += $lines[$i]
-          }
+          if (-not $start) { throw "No CHANGELOG.md section for $version." }
+          $notes = @(
+            for ($i = $start; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^## ') { break }
+              $lines[$i]
+            }
+          )
           $body = @(
-            "## ChatVault ${{ github.ref_name }}", "",
+            "## ChatVault $tag", "",
             ($notes -join "`n").Trim(), "",
-            "**Download**",
-            '- `ChatVault_*_x64-setup.exe`: the installer (recommended)',
-            '- `ChatVault_*_x64_en-US.msi`: Windows Installer package',
-            '- `ChatVault_*_x64-portable.exe`: runs without installing', "",
-            "Installed copies of ChatVault update themselves from this release. Every change: [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)."
+            "### Windows downloads", "",
+            "- ``$setup`` — installer (recommended)",
+            "- ``$msi`` — Windows Installer package",
+            "- ``$portable`` — runs without installing", "",
+            "Installed copies can update automatically."
           ) -join "`n"
-          Set-Content -Path release-notes.md -Value $body -Encoding utf8
-          gh release edit "${{ github.ref_name }}" --notes-file release-notes.md --repo "${{ github.repository }}"
+          $notesPath = Join-Path $env:RUNNER_TEMP 'chatvault-release-notes.md'
+          Set-Content -LiteralPath $notesPath -Value $body -Encoding utf8
 
-      - name: Attach the portable exe
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $name = "ChatVault_${version}_x64-portable.exe"
-          Copy-Item src-tauri/target/release/chatvault.exe $name
-          gh release upload "${{ github.ref_name }}" $name --clobber --repo "${{ github.repository }}"
+          $downloadUrl = "$env:GITHUB_SERVER_URL/$repo/releases/download/$tag"
+          $msiUpdate = @{ url = "$downloadUrl/$msi"; signature = (Get-Content -LiteralPath "$msiPath.sig" -Raw).Trim() }
+          $nsisUpdate = @{ url = "$downloadUrl/$setup"; signature = (Get-Content -LiteralPath "$setupPath.sig" -Raw).Trim() }
+          $manifest = @{
+            version = $version
+            notes = $body
+            pub_date = [DateTimeOffset]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+            platforms = @{ 'windows-x86_64' = $msiUpdate; 'windows-x86_64-msi' = $msiUpdate; 'windows-x86_64-nsis' = $nsisUpdate }
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath latest.json -Encoding utf8
+          $assets = @($msiPath, "$msiPath.sig", $setupPath, "$setupPath.sig", $portable, 'latest.json')
+          foreach ($asset in $assets) {
+            if ((Get-Item -LiteralPath $asset).Length -eq 0) { throw "Empty release asset $asset." }
+          }
+          if (-not $msiUpdate.signature -or -not $nsisUpdate.signature) { throw 'An updater signature is empty.' }
+
+          $existing = gh api --paginate "repos/$repo/releases?per_page=100" --jq ".[] | select(.tag_name == `"$tag`") | .draft"
+          if ($existing -eq 'false') { throw "Release $tag is already published." }
+          if ($existing -ne 'true') {
+            gh release create $tag --repo $repo --verify-tag --draft --title "ChatVault $tag" --notes-file $notesPath
+          }
+          foreach ($asset in $assets) {
+            gh release upload $tag $asset --repo $repo --clobber
+          }
+          $uploaded = gh release view $tag --repo $repo --json assets --jq '.assets[] | select(.state == "uploaded") | .name'
+          foreach ($asset in $assets) {
+            $name = Split-Path -Path $asset -Leaf
+            if ($name -cnotin $uploaded) { throw "Release $tag is missing $name." }
+          }
+          gh release edit $tag --repo $repo --notes-file $notesPath --draft=false --latest

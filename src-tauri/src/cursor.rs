@@ -17,7 +17,6 @@ pub struct CursorChat {
     pub last_ms: i64,
     pub size: i64,
     pub path: String,
-    pub mtime: i64,
 }
 
 fn appdata_cursor() -> Option<PathBuf> {
@@ -181,7 +180,6 @@ fn scan_ide_db(db:&Path,out:&mut Vec<CursorChat>) {
             created_ms: created,
             last_ms: d.get("lastUpdatedAt").and_then(|x| x.as_i64()).or(updated).or(created).unwrap_or(mtime),
             size: raw.len() as i64,
-            mtime,
         });
     }
 }
@@ -226,7 +224,7 @@ fn scan_transcripts(out:&mut Vec<CursorChat>) {
     for p in transcript_files() {
         let msgs=transcript_messages(&p);
         let Some(first)=msgs.iter().find(|m|m.role=="user" && m.kind=="text") else {continue};
-        out.push(CursorChat {id:p.file_stem().map(|s|s.to_string_lossy().to_string()).unwrap_or_default(),title:clip(&first.text,80),cwd:None,created_ms:None,last_ms:mtime_ms(&p),size:fs::metadata(&p).map(|m|m.len() as i64).unwrap_or(0),path:format!("cursor-transcript:{}",p.display()),mtime:mtime_ms(&p)});
+        out.push(CursorChat {id:p.file_stem().map(|s|s.to_string_lossy().to_string()).unwrap_or_default(),title:clip(&first.text,80),cwd:None,created_ms:None,last_ms:mtime_ms(&p),size:fs::metadata(&p).map(|m|m.len() as i64).unwrap_or(0),path:format!("cursor-transcript:{}",p.display())});
     }
 }
 
@@ -308,7 +306,6 @@ fn scan_cli(out: &mut Vec<CursorChat>) {
             created_ms: None,
             last_ms: mtime,
             size: fs::metadata(&store).map(|m| m.len() as i64).unwrap_or(0),
-            mtime,
         });
     }
 }

@@ -765,7 +765,7 @@ pub fn query(provider: &str, account: Option<String>, q: &str, offset: i64, limi
     let acct = account.filter(|a| a != "all");
     let like = format!("%{}%", q.trim().replace('%', "").replace('_', ""));
     let fts = fts_expr(q);
-    let mut tag_sql = String::new();
+    let tag_sql;
     let scope_sql = match scope {
         "live" => " AND backup=0 AND NOT (archived=1 OR (provider||':'||id) IN (SELECT provider||':'||id FROM user_archive))",
         // Every chat that has a copy in the backup folder, whether or not the original still exists.

@@ -3,7 +3,11 @@
 What changed in each version of ChatVault. The newest version is at the top. Downloads are on the
 [Releases page](https://github.com/ssanaullahrais/Chat-Vault/releases).
 
-## [0.6.0] - 2026-11-25
+## [0.5.1] - 2026-11-25
+
+### Release fixes
+
+- Verify that both Windows installers, the portable executable, and the signed updater files are attached before publishing.
 
 ### New
 
