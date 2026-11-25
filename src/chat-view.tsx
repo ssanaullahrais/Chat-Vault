@@ -33,6 +33,8 @@ import {
   PinOff,
   Quote,
   Search,
+  Info,
+  TriangleAlert,
   Trash2,
   User,
   X,
@@ -51,7 +53,7 @@ import { Toggle } from "@/components/ui/toggle";
 import { ActionIcon } from "@/action-icon";
 import { runAction } from "@/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
+import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -67,7 +69,8 @@ import { MessageBody } from "@/message-body";
 import { Highlight, textHas } from "@/highlight";
 import { PROVIDER_SHORT, chatActions, continueTargets, COPY_CONTENT_IDS, deleteKind, fmtDate, fmtSize, prettyTitle, type Chat, type ChatAction, type Msg, type MsgPage, type Provider } from "@/chat-actions";
 import { HeaderSkeleton, MessagesSkeleton } from "@/skeletons";
-import { PlanBlock, StepItem, SubagentBlock, isAgent, isPlan, mergeResults, stepName, type Item } from "@/steps";
+import { CardBlock, PlanBlock, StepItem, SubagentBlock, isAgent, isPlan, mergeResults, type Item } from "@/steps";
+import { isCard, nextPlan, summarize, type PlanStep } from "@/step-summary";
 
 type Props = {
   chat: Chat;
@@ -105,7 +108,7 @@ function Tip({ label, children }: { label: string; children: ReactElement }) {
   );
 }
 
-type Block = { kind: "msg"; i: number; m: Item } | { kind: "plan"; i: number; m: Item } | { kind: "agent"; i: number; m: Item } | { kind: "trace"; i: number; items: { i: number; m: Item }[] };
+type Block = { kind: "msg"; i: number; m: Item; also?: Item[]; alsoAt?: number[] } | { kind: "card"; i: number; m: Item } | { kind: "plan"; i: number; m: Item; steps: PlanStep[]; more: number[] } | { kind: "agent"; i: number; m: Item } | { kind: "trace"; i: number; items: { i: number; m: Item }[] };
 
 export function ChatView(p: Props) {
   const { chat, page } = p;
@@ -154,15 +157,55 @@ export function ChatView(p: Props) {
   // Consecutive tool steps collapse into one Trace.
   const blocks = useMemo(() => {
     const out: Block[] = [];
+    // The plan as it stands, carried through the chat: full lists replace it, short updates ("advance", "done") move
+    // it on. Each turn shows one plan card with the latest state, where the plan first appears in that turn.
+    let plan: PlanStep[] = [];
+    let turnPlan: Extract<Block, { kind: "plan" }> | null = null;
+    // Like the AI apps, a turn's plan card sits at the end of that turn, after its replies and steps.
+    const closeTurn = () => {
+      if (turnPlan) out.push(turnPlan);
+      turnPlan = null;
+    };
     shown.forEach((m, i) => {
-      if (isPlan(m)) out.push({ kind: "plan", i, m });
-      else if (isAgent(m)) out.push({ kind: "agent", i, m });
+      // A message typed while the AI is still working does not end the turn: the plan stays last, after it.
+      if (m.role === "user" && m.kind === "text" && m.name !== "queued") closeTurn();
+      if (isPlan(m)) {
+        plan = nextPlan(m, plan);
+        if (turnPlan) {
+          turnPlan.steps = plan;
+          turnPlan.more.push(i);
+        } else {
+          turnPlan = { kind: "plan", i, m, steps: plan, more: [] };
+        }
+        return;
+      }
+      // Claude's end-of-turn summary checks off the whole list.
+      if (m.kind === "tool" && /(^|__)wrap_up$/.test(m.name ?? "") && plan.length) {
+        plan = plan.map((s) => ({ ...s, status: "done" }));
+        if (turnPlan) turnPlan.steps = plan;
+      }
+      if (isCard(m)) {
+        // The end-of-turn box comes after the plan, as in the app.
+        if (/wrap_up$/i.test(m.name ?? "")) closeTurn();
+        out.push({ kind: "card", i, m });
+      } else if (isAgent(m)) out.push({ kind: "agent", i, m });
       else if (m.kind === "tool" || m.kind === "reasoning") {
         const last = out[out.length - 1];
         if (last && last.kind === "trace") last.items.push({ i, m });
         else out.push({ kind: "trace", i, items: [{ i, m }] });
-      } else out.push({ kind: "msg", i, m });
+      } else {
+        // Pictures and the text sent together (the same second) are one message: the text sits right under the pictures.
+        const last = out[out.length - 1];
+        const kindOk = (x: Item) => x.kind === "image" || x.kind === "text";
+        const together =
+          m.role === "user" && kindOk(m) && last?.kind === "msg" && last.m.role === "user" && kindOk(last.m) && !!m.ts && m.ts.slice(0, 19) === last.m.ts.slice(0, 19) && (m.kind === "image" || last.m.kind === "image") && m.name !== "queued" && last.m.name !== "queued";
+        if (together && last?.kind === "msg") {
+          last.also = [...(last.also ?? []), m];
+          last.alsoAt = [...(last.alsoAt ?? []), i];
+        } else out.push({ kind: "msg", i, m });
+      }
     });
+    closeTurn();
     return out;
   }, [shown]);
 
@@ -183,6 +226,9 @@ export function ChatView(p: Props) {
     blocks.forEach((b, bi) => {
       if (b.kind === "trace") b.items.forEach((t) => (out[t.i] = bi));
       else out[b.i] = bi;
+      // Later updates of a turn's plan are drawn by its one plan card.
+      if (b.kind === "plan") b.more.forEach((i) => (out[i] = bi));
+      if (b.kind === "msg") b.alsoAt?.forEach((i) => (out[i] = bi));
     });
     return out;
   }, [blocks]);
@@ -458,7 +504,7 @@ export function ChatView(p: Props) {
     const path = word || codeText;
     if (path && isFilePath(path)) out.push({ type: "item", label: "Open this file", icon: <FileText strokeWidth={1.5} />, onSelect: () => setFileOpen(path) });
     if (selection) out.push({ type: "item", label: "Copy selection", icon: <Copy strokeWidth={1.5} />, onSelect: say(selection, "Selection") });
-    if (word && p.onSearchAll) out.push({ type: "item", label: `Search all chats for “${word.length > 24 ? `${word.slice(0, 24)}…` : word}”`, icon: <Search strokeWidth={1.5} />, onSelect: () => p.onSearchAll?.(word) });
+    if (word && p.onSearchAll) out.push({ type: "item", label: `Search chats for “${word.length > 24 ? `${word.slice(0, 24)}…` : word}”`, icon: <Search strokeWidth={1.5} />, onSelect: () => p.onSearchAll?.(word) });
     if (said?.text && !selection) out.push({ type: "item", label: said.role === "user" ? "Copy your message" : "Copy this reply", icon: <Copy strokeWidth={1.5} />, onSelect: say(said.text, "Message") });
     if (out.length) out.push({ type: "sep" });
 
@@ -663,16 +709,25 @@ export function ChatView(p: Props) {
                 {virt.getVirtualItems().map((vi) => {
                   const b = blocks[vi.index];
                   if (!b) return null;
+                  // Like the AI apps: one header per turn. A reply that follows the AI's own steps or replies in the same
+                  // turn goes without the name and time, and parts of a turn sit closer together than turns do.
+                  const prev = blocks[vi.index - 1];
+                  const next = blocks[vi.index + 1];
+                  const isUserMsg = (x?: Block) => !!x && x.kind === "msg" && x.m.role === "user";
+                  const continued = b.kind === "msg" && b.m.role !== "user" && b.m.kind !== "summary" && !!prev && !isUserMsg(prev);
+                  const gap = !next || isUserMsg(next) || isUserMsg(b) ? "pb-7" : "pb-3";
                   return (
-                    <div key={vi.key} data-index={vi.index} ref={virt.measureElement} className="absolute left-0 top-0 w-full pb-7" style={{ transform: `translateY(${vi.start - margin}px)` }}>
+                    <div key={vi.key} data-index={vi.index} ref={virt.measureElement} className={cn("absolute left-0 top-0 w-full", gap)} style={{ transform: `translateY(${vi.start - margin}px)` }}>
                       {b.kind === "plan" ? (
-                        <PlanBlock item={b.m} memoKey={String(vi.key)} />
+                        <PlanBlock steps={b.steps} memoKey={String(vi.key)} />
+                      ) : b.kind === "card" ? (
+                        <CardBlock item={b.m} />
                       ) : b.kind === "agent" ? (
                         <SubagentBlock item={b.m} memoKey={String(vi.key)} />
                       ) : b.kind === "trace" ? (
                         <StepsTrace items={b.items} q={query} rowKey={String(vi.key)} />
                       ) : (
-                        <MessageRow m={b.m} provider={chat.provider} q={query} isCurrentMatch={matchIndex >= 0 && matches[matchIndex] === b.i} toast={p.toast} rowKey={String(vi.key)} />
+                        <MessageRow m={b.m} provider={chat.provider} q={query} isCurrentMatch={matchIndex >= 0 && matches[matchIndex] === b.i} toast={p.toast} rowKey={String(vi.key)} continued={continued} also={b.also} />
                       )}
                     </div>
                   );
@@ -849,7 +904,8 @@ function ActionsMenu({ chat, msgs, toast, onRename, onDelete, pinned, onTogglePi
 const StepsTrace = memo(function StepsTrace({ items, q, rowKey }: { items: { i: number; m: Item }[]; q: string; rowKey: string }) {
   const [open, setOpen] = useStickyOpen(rowKey);
   const hasMatch = !!q && items.some((t) => textHas(t.m.text, q));
-  const names = Array.from(new Set(items.map((t) => stepName(t.m))));
+  // "Read legal.tsx, searched code, ran 2 commands", with the lines changed and how many steps failed.
+  const sum = useMemo(() => summarize(items.map((t) => t.m)), [items]);
   return (
     <Trace className="pl-11">
       <TraceCollapsible open={open || hasMatch} onOpenChange={setOpen}>
@@ -858,10 +914,14 @@ const StepsTrace = memo(function StepsTrace({ items, q, rowKey }: { items: { i: 
             <TraceIcon>
               <ListTree />
             </TraceIcon>
-            <TraceTitle>
-              {items.length} {items.length === 1 ? "step" : "steps"}
-            </TraceTitle>
-            <TraceDescription className="max-w-64 truncate">{names.slice(0, 3).join(", ")}</TraceDescription>
+            <TraceTitle className="min-w-0 truncate">{sum.text}</TraceTitle>
+            {(sum.added > 0 || sum.removed > 0) && (
+              <span className="shrink-0 font-mono text-xs tabular-nums">
+                <span className="text-emerald-600 dark:text-emerald-400">+{sum.added}</span>{" "}
+                <span className="text-red-600 dark:text-red-400">−{sum.removed}</span>
+              </span>
+            )}
+            {sum.failed > 0 && <span className="shrink-0 text-xs text-red-600 dark:text-red-400">{sum.failed} failed</span>}
           </TraceLine>
         </TraceCollapsibleTrigger>
         <TraceCollapsibleContent>
@@ -876,12 +936,43 @@ const StepsTrace = memo(function StepsTrace({ items, q, rowKey }: { items: { i: 
   );
 });
 
-const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, toast, rowKey }: { m: Msg; provider: Provider; q: string; isCurrentMatch: boolean; toast: (m: string) => void; rowKey: string }) {
+const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, toast, rowKey, continued = false, also }: { m: Msg; provider: Provider; q: string; isCurrentMatch: boolean; toast: (m: string) => void; rowKey: string; continued?: boolean; also?: Msg[] }) {
   const [open, setOpen] = useStickyOpen(rowKey);
   const [copied, setCopied] = useState<string | null>(null);
   const time = m.ts ? new Date(m.ts).toLocaleTimeString(undefined, { timeStyle: "short" }) : "";
   const isUser = m.role === "user";
   const who = isUser ? "You" : PROVIDER_SHORT[provider];
+
+  // A note the AI app shows in the conversation: a command's output, "Conversation compacted", an error, a pull
+  // request, an attachment, or an entry of a kind ChatVault does not know yet.
+  if (m.kind === "notice") {
+    const isErr = m.error === true;
+    const url = m.data && typeof m.data === "object" ? String((m.data as Record<string, unknown>).url ?? "") : "";
+    const mono = m.name === "command-output";
+    const longNote = m.text.length > 600 || m.text.split("\n").length > 8;
+    const shownText = longNote && !open && !q ? m.text.split("\n").slice(0, 8).join("\n").slice(0, 600) + "…" : m.text;
+    return (
+      <div className="flex gap-2 pl-11 text-xs text-muted-foreground">
+        {isErr ? <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-red-600 dark:text-red-400" strokeWidth={1.5} /> : <Info className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.5} />}
+        <div className="min-w-0 flex-1">
+          {url ? (
+            <button type="button" className="cursor-pointer text-left underline underline-offset-4 hover:text-foreground" onClick={() => void openUrl(url).catch(() => {})}>
+              {m.text}
+            </button>
+          ) : (
+            <p className={cn("whitespace-pre-wrap break-words", mono && "font-mono", isErr && "text-red-600 dark:text-red-400")}>
+              <Highlight text={shownText} q={q} activeMark={isCurrentMatch} />
+            </p>
+          )}
+          {longNote && !q && (
+            <button className="mt-0.5 cursor-pointer underline" onClick={() => setOpen((o) => !o)}>
+              {open ? "Show less" : "Show all"}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   if (m.kind === "summary") {
     return (
@@ -899,9 +990,12 @@ const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, to
     );
   }
 
-  const long = m.text.length > 1800;
-  const expanded = open || !!q;
-  const text = long && !expanded ? m.text.slice(0, 1800) + "…" : m.text;
+  // This message and anything sent with it in the same second (pictures, then text).
+  const parts = [m, ...(also ?? [])].sort((a, b) => Number(b.kind === "image") - Number(a.kind === "image"));
+  const copyText = parts.filter((x) => x.kind !== "image").map((x) => x.text).join("\n\n");
+  // Messages are always shown in full, as in the AI apps (no "Show all" to click).
+  const long = false;
+  const text = m.text;
   const copy = async (what: string, value: string) => {
     try {
       await navigator.clipboard.writeText(value);
@@ -914,50 +1008,54 @@ const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, to
 
   return (
     <Message align={isUser ? "end" : "start"}>
-      <MessageAvatar className="self-start bg-transparent">
+      <MessageAvatar className={cn("self-start bg-transparent", continued && "invisible")} aria-hidden={continued || undefined}>
         <Avatar>
           <AvatarFallback className={cn("overflow-hidden", isUser ? "bg-secondary text-secondary-foreground" : provider === "codex" ? "bg-transparent" : "bg-muted")}>
             {isUser ? <User className="size-4" /> : <ProviderLogo provider={provider} className={provider === "codex" ? "size-full" : "size-5"} />}
           </AvatarFallback>
         </Avatar>
       </MessageAvatar>
-      <MessageContent>
-        <MessageHeader className={cn("gap-2", isUser && "flex-row-reverse")}>
+      {/* Your messages take at most about three quarters of the column, as in the AI apps, instead of its full width. */}
+      <MessageContent className={isUser ? "max-w-[78%]" : undefined}>
+        <MessageHeader className={cn("gap-2", isUser && "flex-row-reverse", continued && "hidden")}>
           <span className="text-foreground">{who}</span>
           <span className="font-normal">{time}</span>
           <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100">
-            <MiniAction label={copied === "text" ? "Copied" : "Copy message"} onClick={() => copy("text", m.text)}>
+            <MiniAction label={copied === "text" ? "Copied" : "Copy message"} onClick={() => copy("text", copyText)}>
               {copied === "text" ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             </MiniAction>
-            <MiniAction label={copied === "md" ? "Copied" : "Copy as Markdown"} onClick={() => copy("md", `**${who}** · ${time}\n\n${m.text}`)}>
+            <MiniAction label={copied === "md" ? "Copied" : "Copy as Markdown"} onClick={() => copy("md", `**${who}** · ${time}\n\n${copyText}`)}>
               {copied === "md" ? <Check className="size-3.5" /> : <FileText className="size-3.5" />}
             </MiniAction>
-            <MiniAction label={copied === "quote" ? "Copied" : "Copy as quote"} onClick={() => copy("quote", m.text.split("\n").map((l) => `> ${l}`).join("\n"))}>
+            <MiniAction label={copied === "quote" ? "Copied" : "Copy as quote"} onClick={() => copy("quote", copyText.split("\n").map((l) => `> ${l}`).join("\n"))}>
               {copied === "quote" ? <Check className="size-3.5" /> : <Quote className="size-3.5" />}
             </MiniAction>
           </div>
         </MessageHeader>
-        {m.kind === "image" && typeof m.data === "string" ? (
-          <div className={cn("max-w-full", isUser && "flex justify-end")}>
-            <ChatImage src={m.data} />
-          </div>
-        ) : (
-        <Bubble variant={isUser ? "secondary" : "outline"} className="max-w-full">
-          <BubbleContent className="overflow-visible">
-            {m.kind === "image" ? <span className="text-muted-foreground">[Image]</span> : <MessageBody text={text} q={q} active={isCurrentMatch} assistant={!isUser} />}
-            {long && !q && (
-              <button className="mt-1 text-xs text-muted-foreground underline" onClick={() => setOpen((o) => !o)}>
-                {open ? "Show less" : "Show all"}
-              </button>
-            )}
-          </BubbleContent>
-        </Bubble>
+        {/* Pictures first, then the text that was sent with them, all in this one message. */}
+        {parts.map((part, pi) =>
+          part.kind === "image" && typeof part.data === "string" ? (
+            <div key={pi} className={cn("max-w-full", isUser && "flex justify-end")}>
+              <ChatImage src={part.data} />
+            </div>
+          ) : (
+            <Bubble key={pi} variant={isUser ? "secondary" : "outline"} className="max-w-full">
+              <BubbleContent className="overflow-visible">
+                {part.kind === "image" ? <span className="text-muted-foreground">[Image]</span> : <MessageBody text={part === m ? text : part.text} q={q} active={isCurrentMatch} assistant={!isUser} />}
+                {part === m && long && !q && (
+                  <button className="mt-1 text-xs text-muted-foreground underline" onClick={() => setOpen((o) => !o)}>
+                    {open ? "Show less" : "Show all"}
+                  </button>
+                )}
+              </BubbleContent>
+            </Bubble>
+          ),
         )}
       </MessageContent>
     </Message>
   );
   // The toast callback changes identity on every render; it is deliberately left out so rows are not redrawn while scrolling.
-}, (a, b) => a.m === b.m && a.provider === b.provider && a.q === b.q && a.isCurrentMatch === b.isCurrentMatch && a.rowKey === b.rowKey);
+}, (a, b) => a.m === b.m && a.provider === b.provider && a.q === b.q && a.isCurrentMatch === b.isCurrentMatch && a.rowKey === b.rowKey && a.continued === b.continued && a.also === b.also);
 
 function MiniAction({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
   return (

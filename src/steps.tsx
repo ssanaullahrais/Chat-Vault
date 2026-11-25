@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { useStickyOpen } from "@/sticky-open";
-import { Bot, Brain, CircleCheck, CircleDashed, Circle, Globe, ListTodo, Terminal as TerminalIcon, Wrench, ArrowUpRight } from "lucide-react";
+import { Bot, Brain, FilePen, CircleCheck, CircleDashed, Circle, Globe, ListTodo, Terminal as TerminalIcon, Wrench, ArrowUpRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { CodeBlock, CodeBlockContent } from "@/components/ui/code-block";
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
@@ -10,6 +10,7 @@ import { ColoredOutput, ShellLine, guessLanguage } from "@/shell-highlight";
 import { hostname, uniqueUrls } from "@/ai-elements";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Msg } from "@/chat-actions";
+import { cardOf, editInfo, failed, family, fileName, prettyTool, shellCommand, stepDescription, type PlanStep } from "@/step-summary";
 
 export type Item = Msg & { result?: Msg };
 
@@ -20,11 +21,10 @@ export function mergeResults(msgs: Msg[]): Item[] {
   return msgs.filter((m) => m.kind !== "result").map((m) => (m.kind === "tool" && m.id && results.has(m.id) ? { ...m, result: results.get(m.id) } : m));
 }
 
-const SHELL = /^(bash|shell|exec_command|powershell|local_shell|shell_command|exec)$/i;
-export const isPlan = (m: Item) => m.kind === "tool" && (m.name === "TodoWrite" || m.name === "update_plan");
-export const isAgent = (m: Item) => m.kind === "tool" && (m.name === "Task" || m.name === "Agent");
-const isShell = (m: Item) => m.kind === "tool" && !!m.name && SHELL.test(m.name);
-const isWeb = (m: Item) => m.kind === "tool" && (m.name === "WebFetch" || m.name === "WebSearch");
+export const isPlan = (m: Item) => family(m) === "plan";
+export const isAgent = (m: Item) => family(m) === "agent";
+const isShell = (m: Item) => family(m) === "shell";
+const isWeb = (m: Item) => family(m) === "web";
 
 const str = (v: unknown) => (typeof v === "string" ? v : Array.isArray(v) ? v.join(" ") : "");
 const data = (m: Item) => (m.data ?? {}) as Record<string, unknown>;
@@ -37,22 +37,9 @@ function splitText(text: string) {
 
 export const stepName = (m: Item) => m.name ?? (m.kind === "reasoning" ? "Thought" : splitText(m.text)[0]);
 
-type PlanStep = { text: string; status: "done" | "running" | "pending" };
-
-function planSteps(m: Item): PlanStep[] {
-  const d = data(m);
-  const norm = (s: unknown): PlanStep["status"] => (s === "completed" ? "done" : s === "in_progress" ? "running" : "pending");
-  const todos = d.todos as { content?: string; status?: string }[] | undefined;
-  const plan = d.plan as { step?: string; status?: string }[] | undefined;
-  if (todos) return todos.map((t) => ({ text: t.content ?? "", status: norm(t.status) }));
-  if (plan) return plan.map((t) => ({ text: t.step ?? "", status: norm(t.status) }));
-  return [];
-}
-
-/** The task list or plan the AI kept, with how far it got. */
-export function PlanBlock({ item, memoKey }: { item: Item; memoKey?: string }) {
+/** The task list or plan the AI kept, as it stood at the end of the turn, with how far it got. */
+export function PlanBlock({ steps, memoKey }: { steps: PlanStep[]; memoKey?: string }) {
   const [open, setOpen] = useStickyOpen(memoKey, true);
-  const steps = planSteps(item);
   if (!steps.length) return null;
   const done = steps.filter((s) => s.status === "done").length;
   const running = steps.some((s) => s.status === "running");
@@ -82,6 +69,62 @@ export function PlanBlock({ item, memoKey }: { item: Item; memoKey?: string }) {
         </TraceCollapsibleContent>
       </TraceCollapsible>
     </Trace>
+  );
+}
+
+/**
+ * A card the AI app drew for you: the end-of-turn "next step" box (recap, the question, its buttons) or a question
+ * with options, with the answer when it is in the file. Buttons are shown as they appeared; they do nothing here.
+ */
+export function CardBlock({ item }: { item: Item }) {
+  const card = cardOf(item);
+  if (!card) return null;
+  if (card.kind === "next") {
+    return (
+      <div className="pl-11">
+        <div className="max-w-2xl rounded-xl border bg-card p-3.5 text-sm">
+          {card.recap && <p className="text-muted-foreground">{card.recap}</p>}
+          {card.ask && <p className={card.recap ? "mt-3 font-medium" : "font-medium"}>{card.ask}</p>}
+          {card.actions.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {card.actions.map((a, i) => (
+                <span key={a + i} className={i === 0 ? "rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground" : "rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground"}>
+                  {a}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="pl-11">
+      <div className="max-w-2xl space-y-3 rounded-xl border bg-card p-3.5 text-sm">
+        {card.questions.map((q, qi) => (
+          <div key={qi}>
+            {q.header && <p className="mb-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{q.header}</p>}
+            <p className="font-medium">{q.question}</p>
+            {q.options.length > 0 && (
+              <ul className="mt-2 space-y-1">
+                {q.options.map((o, oi) => {
+                  const picked = !!card.answer && card.answer.includes(o.label);
+                  return (
+                    <li key={oi} className={picked ? "rounded-md border border-foreground/30 bg-muted/60 px-2.5 py-1.5" : "rounded-md border px-2.5 py-1.5"}>
+                      <span className="flex items-center gap-1.5">
+                        {picked && <CircleCheck className="size-3.5 shrink-0" />}
+                        <span className={picked ? "font-medium" : undefined}>{o.label}</span>
+                      </span>
+                      {o.description && <span className="block text-xs text-muted-foreground">{o.description}</span>}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -152,21 +195,32 @@ export const StepItem = memo(function StepItem({ item, q, memoKey }: { item: Ite
     );
   }
 
+  const desc = stepDescription(item);
+  const bad = failed(item);
+  const failedTag = bad ? <span className="shrink-0 text-xs text-red-600 dark:text-red-400">Failed</span> : null;
+
   if (isShell(item)) {
-    const d = data(item);
-    const cmd = str(d.command) || str(d.cmd) || detail;
+    const cmd = shellCommand(item) || detail;
     const out = item.result?.text ?? "";
     return (
       <Trace>
         <TraceCollapsible open={open} onOpenChange={setOpen}>
           <TraceCollapsibleTrigger>
-            <TraceLine status={item.result?.error ? "error" : undefined}>
+            <TraceLine status={bad ? "error" : undefined}>
               <TraceIcon>
                 <TerminalIcon />
               </TraceIcon>
-              <TraceTitle className="truncate font-mono text-xs">
-                Ran <ShellLine text={clipText(cmd.split("\n")[0], 90)} q={q} />
-              </TraceTitle>
+              {/* The AI's own description of the command when it gave one ("Type-check the frontend"), else the command. */}
+              {desc ? (
+                <TraceTitle className="min-w-0 truncate">
+                  <Highlight text={desc} q={q} activeMark={false} />
+                </TraceTitle>
+              ) : (
+                <TraceTitle className="truncate font-mono text-xs">
+                  Ran <ShellLine text={clipText(cmd.split("\n")[0], 90)} q={q} />
+                </TraceTitle>
+              )}
+              {failedTag}
             </TraceLine>
           </TraceCollapsibleTrigger>
           <TraceCollapsibleContent>
@@ -233,14 +287,40 @@ export const StepItem = memo(function StepItem({ item, q, memoKey }: { item: Ite
     );
   }
 
+  const edit = family(item) === "edit" ? editInfo(item) : null;
+  if (edit) {
+    const target = edit.files[0] ?? filePath;
+    return (
+      <Trace>
+        <TraceLine status={bad ? "error" : undefined}>
+          <TraceIcon>
+            <FilePen />
+          </TraceIcon>
+          <TraceTitle className="shrink-0">{edit.files.length > 1 ? `Edited ${edit.files.length} files` : "Edited"}</TraceTitle>
+          {target && edit.files.length <= 1 && (
+            <button type="button" onClick={() => files.open(target)} className="min-w-0 cursor-pointer truncate text-left font-mono text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground" title={target}>
+              <Highlight text={fileName(target)} q={q} activeMark={false} />
+            </button>
+          )}
+          {(edit.added > 0 || edit.removed > 0) && (
+            <span className="shrink-0 font-mono text-xs tabular-nums">
+              <span className="text-emerald-600 dark:text-emerald-400">+{edit.added}</span> <span className="text-red-600 dark:text-red-400">−{edit.removed}</span>
+            </span>
+          )}
+          {failedTag}
+        </TraceLine>
+      </Trace>
+    );
+  }
+
   return (
     <Trace>
-      <TraceLine>
+      <TraceLine status={bad ? "error" : undefined}>
         <TraceIcon>
           <Wrench />
         </TraceIcon>
         <TraceTitle className="font-medium text-foreground/80">
-          <Highlight text={name} q={q} activeMark={false} />
+          <Highlight text={desc || prettyTool(item.name ?? name)} q={q} activeMark={false} />
         </TraceTitle>
         {filePath ? (
           <button type="button" onClick={() => files.open(filePath)} className="min-w-0 cursor-pointer truncate text-left font-mono text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground">

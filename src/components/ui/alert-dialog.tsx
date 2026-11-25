@@ -36,9 +36,25 @@ function AlertDialogOverlay({
   )
 }
 
+/** While a confirmation is open, the dialog it was opened from is hidden behind it (see `html[data-alert-open]` in
+ *  index.css), so only one box is on screen. Counted, so two confirmations in a row do not show it early. */
+let openAlerts = 0
+function HideDialogsBehind() {
+  React.useEffect(() => {
+    openAlerts += 1
+    document.documentElement.dataset.alertOpen = ""
+    return () => {
+      openAlerts = Math.max(0, openAlerts - 1)
+      if (openAlerts === 0) delete document.documentElement.dataset.alertOpen
+    }
+  }, [])
+  return null
+}
+
 function AlertDialogContent({
   className,
   size = "default",
+  children,
   ...props
 }: AlertDialogPrimitive.Popup.Props & {
   size?: "default" | "sm"
@@ -54,7 +70,10 @@ function AlertDialogContent({
           className
         )}
         {...props}
-      />
+      >
+        {children}
+        <HideDialogsBehind />
+      </AlertDialogPrimitive.Popup>
     </AlertDialogPortal>
   )
 }

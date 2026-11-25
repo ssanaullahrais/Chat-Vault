@@ -267,6 +267,8 @@ fn item(v: &Value, ms: i64) -> Msg {
             } else {
                 v.get("arguments").cloned().unwrap_or_else(|| v.clone())
             }));
+            // File changes carry their diffs: count the lines from the full item.
+            crate::providers::annotate(&mut m, Some(v));
             m.error = Some(
                 v.get("exitCode")
                     .and_then(Value::as_i64)

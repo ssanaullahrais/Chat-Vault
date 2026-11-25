@@ -42,6 +42,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { AppToaster, notify, notifyError, runAction } from "@/toast";
+import { ConfirmHost } from "@/components/confirm";
 import { initBulkExport } from "@/bulk-export";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -166,6 +167,7 @@ export default function App() {
   }, []);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [syncOpen, setSyncOpen] = useState(false);
+  const [syncTab, setSyncTab] = useState<"backups" | "backup" | "drive">("backups");
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Tools switched off in Settings are left out of every list. This only makes the screen redraw when that changes.
   const [, setOffTick] = useState(0);
@@ -250,8 +252,26 @@ export default function App() {
     let cancelled = false;
     // Google Drive, when connected and set to sync automatically. It runs quietly: offline or failing, the app carries on
     // and Sync & backup shows what went wrong. Chats that arrived from other PCs are added to the list.
+    // Each time, Google is asked whether the connection still works: the access may have been removed in the Google
+    // account. Then the app says so once, instead of failing quietly.
+    let wasConnected: boolean | null = null;
+    const checkDrive = async () => {
+      const s = await invoke<DriveStatus>("gdrive_check").catch(() => null);
+      if (cancelled || !s) return s;
+      if (wasConnected && !s.connected && s.available) notifyError("Google Drive was disconnected because its access was removed in your Google account. Connect it again in Sync & backup.");
+      wasConnected = s.connected;
+      return s;
+    };
+    let lastCheck = 0;
+    const onFocus = () => {
+      if (Date.now() - lastCheck < 60_000) return;
+      lastCheck = Date.now();
+      void checkDrive();
+    };
+    window.addEventListener("focus", onFocus);
     const driveSync = async () => {
-      const s = await invoke<DriveStatus>("gdrive_status").catch(() => null);
+      lastCheck = Date.now();
+      const s = await checkDrive();
       if (cancelled || !s?.connected || !s.autoSync || s.busy) return;
       const r = await invoke<DriveStats>("gdrive_sync", { restore: false }).catch(() => null);
       if (!cancelled && r && (r.downloaded > 0 || r.conflicts > 0)) await rescan();
@@ -281,6 +301,7 @@ export default function App() {
     const offSettings = listen("tray-settings", () => setSettingsOpen(true));
     return () => {
       cancelled = true;
+      window.removeEventListener("focus", onFocus);
       window.clearTimeout(startup);
       void un.then((f) => f());
       void offSync.then((f) => f());
@@ -1199,7 +1220,7 @@ export default function App() {
             { id: "codex", label: "Show Codex chats", icon: <ProviderLogo provider="codex" className="size-4" />, run: () => switchProvider("codex") },
             { id: "sync", label: "Sync & backup", icon: <DatabaseBackup className="size-4" />, run: () => setSyncOpen(true) },
             { id: "settings", label: "Settings", icon: <SettingsIcon className="size-4" />, run: () => setSettingsOpen(true) },
-            { id: "refresh", label: "Scan this PC for new chats", icon: <RefreshCw className="size-4" />, run: () => void rescan() },
+            { id: "refresh", label: "Scan for new chats", icon: <RefreshCw className="size-4" />, run: () => void rescan() },
             { id: "theme", label: dark ? "Light theme" : "Dark theme", icon: dark ? <Sun className="size-4" /> : <Moon className="size-4" />, run: () => setDark((d) => !d) },
           ]}
         />}
@@ -1212,7 +1233,7 @@ export default function App() {
           </Tip>
         </div>
         <Suspense fallback={null}>
-          {syncOpen && <SyncDialog open={syncOpen} onOpenChange={setSyncOpen} onChanged={rescan} onMove={setMovePending} toast={say} />}
+          {syncOpen && <SyncDialog open={syncOpen} onOpenChange={(o) => { setSyncOpen(o); if (!o) setSyncTab("backups"); }} onChanged={rescan} onMove={setMovePending} toast={say} initialTab={syncTab} />}
           {movePending && (
             <MoveBackupDialog
               check={movePending}
@@ -1237,7 +1258,10 @@ export default function App() {
             <SettingsDialog
               open={settingsOpen}
               onOpenChange={setSettingsOpen}
-              onOpenBackup={() => setSyncOpen(true)}
+              onOpenBackup={(tab) => {
+                setSyncTab(tab ?? "backups");
+                setSyncOpen(true);
+              }}
               onToolsChanged={async () => {
                 const off = await applyOff();
                 if (provider !== "all" && off.includes(provider)) setProvider("all");
@@ -1279,6 +1303,7 @@ export default function App() {
           }}
         />
         <AppToaster />
+        <ConfirmHost />
       </div>
     </TooltipProvider>
   );

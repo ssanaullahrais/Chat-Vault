@@ -58,19 +58,13 @@ Requires Windows 10 or 11 (64-bit). The installers are small (about 3 to 4 MB) a
 
 ## Privacy
 
-ChatVault is a local app. It only **reads** your chat files, never uploads them and needs no account. The only network request it makes is to GitHub, to check for a new version. It never touches your sign-in files.
+ChatVault is a local app. It **reads** your chat files and needs no account. By default nothing leaves your PC: the only network request it makes is to GitHub, to check for a new version. It never touches your sign-in files.
 
-## Code signing policy
+**Optional Google Drive backup.** If you choose *Connect Google Drive* in *Sync & backup*, ChatVault copies your backup folder (the chats and their pictures, compressed) straight from your PC to **your own** Google Drive, and back to a new PC. It asks Google for one permission only, `drive.appdata`: a hidden app folder in your Drive, so it cannot see or change any of your other files. There is no ChatVault server in between, and your sign-in is kept in the Windows Credential Manager. You can cancel a sync, delete the backup from Drive, or disconnect at any time. Details: [privacy policy](https://ssanaullahrais.github.io/Chat-Vault/privacy.html) and [setup guide](docs/GOOGLE_DRIVE_SETUP.md).
 
-The installers are built from this repository by the [release workflow](.github/workflows/release.yml) on GitHub Actions, and every release is approved by hand before it is published. ChatVault is applying for free code signing from [SignPath Foundation](https://signpath.org). Until that is approved, the Windows installers are not code signed, so Windows may show an "unknown publisher" warning. The update files carry a separate updater signature that the app checks before installing an update.
+## Releases
 
-**Team roles**
-
-- Author, reviewer and approver: [@ssanaullahrais](https://github.com/ssanaullahrais). Every release is approved by this person before signing.
-
-**Privacy**
-
-ChatVault does not send information to any other networked system, except a check against GitHub for a new version. See [Privacy](#privacy).
+The installers are built from this repository by the [release workflow](.github/workflows/release.yml) on GitHub Actions, and every release is approved by hand before it is published. The Windows installers are not code signed, so Windows may show an "unknown publisher" warning. The update files carry a separate updater signature that the app checks before installing an update.
 
 ## Keyboard shortcuts
 

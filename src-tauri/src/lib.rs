@@ -10,6 +10,7 @@ mod paths;
 mod providers;
 mod search;
 mod gdrive;
+mod backups;
 mod sources;
 mod sync;
 
@@ -67,9 +68,21 @@ fn valid_id(id: &str) -> bool {
 /// Lines worth parsing. Skipping the rest keeps very large transcripts fast.
 pub(crate) fn relevant(provider: &str, line: &str) -> bool {
     if provider == "codex" {
+        // Messages and steps, plus the notes Codex shows: compaction, a stopped turn, an error, voice transcripts.
         line.contains("\"response_item\"")
+            || line.contains("\"type\":\"compacted\"")
+            || line.contains("\"turn_aborted\"")
+            || line.contains("\"type\":\"realtime_item\"")
+            || (line.contains("\"type\":\"event_msg\"") && (line.contains("\"type\":\"error\"") || line.contains("\"type\":\"stream_error\"")))
     } else {
-        line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")
+        // Messages typed while Claude is working are saved as "queued_command" attachments, not as user lines; notes
+        // such as "Conversation compacted" are "system" lines; @-mentioned files are "file" attachments.
+        line.contains("\"type\":\"user\"")
+            || line.contains("\"type\":\"assistant\"")
+            || line.contains("\"queued_command\"")
+            || line.contains("\"type\":\"system\"")
+            || line.contains("\"type\":\"pr-link\"")
+            || line.contains("\"attachment\":{\"type\":\"file\"")
     }
 }
 
@@ -149,7 +162,7 @@ async fn chat_outline(provider: String, path: String) -> Result<Vec<OutlineTick>
             let user_line = if provider == "codex" {
                 line.contains("\"response_item\"") && line.contains("\"role\":\"user\"")
             } else {
-                line.contains("\"type\":\"user\"")
+                line.contains("\"type\":\"user\"") || line.contains("\"queued_command\"")
             };
             if !user_line {
                 continue;
@@ -1486,6 +1499,60 @@ async fn gdrive_sync(app: AppHandle, restore: bool) -> Result<gdrive::Stats, Str
 }
 
 #[tauri::command]
+async fn backup_entries(drive: bool) -> Result<Vec<backups::Entry>, String> {
+    tauri::async_runtime::spawn_blocking(move || backups::entries(drive)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn backup_delete(units: Vec<backups::UnitRef>, local: bool, drive: bool) -> Result<gdrive::Removed, String> {
+    tauri::async_runtime::spawn_blocking(move || backups::delete(&units, local, drive)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn backup_transfer(app: AppHandle, units: Vec<backups::UnitRef>, up: bool) -> Result<gdrive::Stats, String> {
+    let set = units.into_iter().map(|u| (u.provider, u.key)).collect();
+    tauri::async_runtime::spawn_blocking(move || gdrive::transfer(&app, &set, up)).await.map_err(|e| e.to_string())?
+}
+
+/// Checks with Google that the Drive connection still works, then returns the status.
+#[tauri::command]
+async fn gdrive_check() -> Result<gdrive::Status, String> {
+    tauri::async_runtime::spawn_blocking(gdrive::check).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn backup_sets(drive: bool) -> Result<Vec<backups::BackupSet>, String> {
+    tauri::async_runtime::spawn_blocking(move || backups::sets(drive)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn backup_delete_local_all() -> Result<gdrive::Removed, String> {
+    tauri::async_runtime::spawn_blocking(backups::delete_local_all).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn gdrive_delete_device(device: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || gdrive::delete_device(&device)).await.map_err(|e| e.to_string())?
+}
+
+/// Downloads one PC's whole Drive backup into this PC's backup folder (a file changed on both sides keeps both copies).
+#[tauri::command]
+async fn gdrive_download_device(app: AppHandle, device: String) -> Result<gdrive::Stats, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let units = backups::device_units(&device)?;
+        gdrive::transfer(&app, &units, false)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Cancels the running Google Drive sync. What it already uploaded stays, and the next sync carries on from there.
+#[tauri::command]
+fn gdrive_cancel_sync() {
+    gdrive::cancel_sync();
+}
+
+#[tauri::command]
 fn gdrive_set_auto(on: bool) {
     gdrive::set_auto(on);
 }
@@ -1663,6 +1730,15 @@ pub fn run() {
             gdrive_disconnect,
             gdrive_sync,
             gdrive_set_auto,
+            gdrive_cancel_sync,
+            backup_entries,
+            backup_delete,
+            backup_transfer,
+            backup_sets,
+            gdrive_check,
+            backup_delete_local_all,
+            gdrive_delete_device,
+            gdrive_download_device,
             chat_sources,
             open_chat_source,
             backup_location_info,

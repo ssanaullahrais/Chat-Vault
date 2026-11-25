@@ -52,6 +52,31 @@ pub(crate) fn walk_all(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Which files under Claude Code's projects folder are backed up: the chats (`project/chat.jsonl`) and what belongs to a
+/// chat, kept in a folder named after it (`project/chat/tool-results/...` pictures and tool output, `.../subagents/...`).
+fn claude_keeps(parts: &[String], is_jsonl: bool) -> bool {
+    (parts.len() == 2 && is_jsonl) || (parts.len() >= 4 && matches!(parts[2].as_str(), "tool-results" | "subagents"))
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::claude_keeps;
+
+    fn p(s: &str) -> Vec<String> {
+        s.split('/').map(String::from).collect()
+    }
+
+    #[test]
+    fn chats_and_their_media_are_kept() {
+        assert!(claude_keeps(&p("proj/chat.jsonl"), true));
+        assert!(claude_keeps(&p("proj/chat/tool-results/shot.png"), false));
+        assert!(claude_keeps(&p("proj/chat/tool-results/nested/out.txt"), false));
+        assert!(claude_keeps(&p("proj/chat/subagents/agent-1.jsonl"), true));
+        assert!(!claude_keeps(&p("proj/notes.txt"), false));
+        assert!(!claude_keeps(&p("proj/chat/other/file.png"), false));
+    }
+}
+
 /// (source, destination) pairs. `forward` = live -> backup, otherwise backup -> live.
 fn pairs(forward: bool) -> Vec<(PathBuf, PathBuf)> {
     let Some(b) = backup_root() else { return Vec::new() };
@@ -67,6 +92,9 @@ fn pairs(forward: bool) -> Vec<(PathBuf, PathBuf)> {
     if let (true, Some(c)) = (on("codex"), codex_home()) {
         maps.push((c.join("sessions"), b.join("codex").join("sessions"), 0));
         maps.push((c.join("archived_sessions"), b.join("codex").join("archived_sessions"), 0));
+        // Pictures Codex generated and files attached to chats; the pictures you paste are inside the chat files.
+        maps.push((c.join("generated_images"), b.join("codex").join("generated_images"), 0));
+        maps.push((c.join("attachments"), b.join("codex").join("attachments"), 0));
     }
     // Cursor: the plain-text agent transcripts and the CLI chat stores. The IDE database itself is not copied while Cursor may be writing to it.
     if let (true, Some(h)) = (on("cursor"), home()) {
@@ -96,17 +124,25 @@ fn pairs(forward: bool) -> Vec<(PathBuf, PathBuf)> {
             let Ok(rel) = f.strip_prefix(from) else { continue };
             // Claude project folders also hold sub-agent and tool-result files; keep only transcripts.
             let is_jsonl = f.extension().map(|e| e == "jsonl").unwrap_or(false);
-            if filter == 1 && !(rel.components().count() == 2 && is_jsonl) {
-                continue;
+            // Claude Code: the chat itself (project/chat.jsonl) plus what belongs to it, kept in a folder named after the
+            // chat: screenshots and other results of its tools (tool-results/), and its helper agents' own chats
+            // (subagents/).
+            if filter == 1 {
+                let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+                if !claude_keeps(&parts, is_jsonl) {
+                    continue;
+                }
             }
             if filter == 2 && !(is_jsonl && rel.to_string_lossy().contains("agent-transcripts")) {
                 continue;
             }
-            // Gemini: only the saved chats (tmp/<project>/chats/*.json) and the file naming the project.
+            // Gemini: the saved chats (tmp/<project>/chats/*.json and the newer .jsonl), what its tools produced
+            // (tool-outputs/), and the file naming the project.
             if filter == 3 {
                 let s = rel.to_string_lossy();
                 let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                if !((s.contains("chats") && name.ends_with(".json")) || name == ".project_root") {
+                let chat = s.contains("chats") && (name.ends_with(".json") || name.ends_with(".jsonl"));
+                if !(chat || s.contains("tool-outputs") || name == ".project_root") {
                     continue;
                 }
             }
@@ -146,7 +182,13 @@ fn run(app: &AppHandle, forward: bool) -> Result<SyncStats, String> {
         let todo: Vec<&(PathBuf, PathBuf)> = all.iter().filter(|(s, d)| needs_copy(s, d, forward)).collect();
         let mut stats = SyncStats { total: todo.len(), skipped: all.len() - todo.len(), ..Default::default() };
         let phase = if forward { "Backing up" } else { "Restoring" };
+        let mut stopped = false;
         for (i, (src, dst)) in todo.iter().enumerate() {
+            // A Google Drive sync that started this backup was cancelled: stop copying.
+            if i % 10 == 0 && crate::gdrive::cancel_requested() {
+                stopped = true;
+                break;
+            }
             if let Some(parent) = dst.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -170,7 +212,8 @@ fn run(app: &AppHandle, forward: bool) -> Result<SyncStats, String> {
             }
         }
         merge_codex_index(forward);
-        if forward {
+        // A backup stopped halfway is not a finished one: "last synced" keeps the time of the last complete backup.
+        if forward && !stopped {
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -235,6 +278,11 @@ pub fn backup(app: &AppHandle) -> Result<SyncStats, String> {
 
 pub fn restore(app: &AppHandle) -> Result<SyncStats, String> {
     run(app, false)
+}
+
+/// How many files "Restore missing" would copy back into the tools now (files in the backup the tools do not have).
+pub fn restore_preview() -> usize {
+    pairs(false).iter().filter(|(s, d)| needs_copy(s, d, false)).count()
 }
 
 pub fn status() -> BackupStatus {

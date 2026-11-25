@@ -2,7 +2,7 @@ import { notifyError } from "@/toast";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { DatabaseBackup, FileDown, FolderInput, FolderOpen, HardDrive, Info, Loader2, RefreshCw, RotateCcw, Trash2, TriangleAlert, UploadCloud } from "lucide-react";
+import { DatabaseBackup, FileDown, Undo2, FolderInput, FolderOpen, Archive, HardDrive, Info, Loader2, RefreshCw, RotateCcw, Trash2, TriangleAlert, UploadCloud } from "lucide-react";
 import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,9 @@ import { startBulkExport, useBulkExport } from "@/bulk-export";
 import { PanelHeader, RAIL_TAB, RailLabel } from "@/rail";
 import { AUTO_SYNC_KEY } from "@/store";
 import { DriveLogo, GoogleDrivePanel } from "@/gdrive-panel";
+import { BackupsPanel } from "@/backups-panel";
+import { confirmAction } from "@/components/confirm";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 type Status = { path: string; exists: boolean; files: number; bytes: number; lastSyncMs: number | null };
 type Stats = { copied: number; skipped: number; failed: number; bytes: number; total: number };
@@ -40,6 +43,7 @@ export function SyncDialog({
   onChanged,
   onMove,
   toast,
+  initialTab = "backups",
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
@@ -47,6 +51,8 @@ export function SyncDialog({
   /** A new backup folder was chosen and checked; the confirm step opens in its own dialog. */
   onMove: (c: Check) => void;
   toast: (m: string) => void;
+  /** The tab shown first: "drive" when opened from Settings' Google Drive card. */
+  initialTab?: "backups" | "backup" | "drive";
 }) {
   const [status, setStatus] = useState<Status | null>(null);
   const [busy, setBusy] = useState<"sync" | "restore" | null>(null);
@@ -56,7 +62,7 @@ export function SyncDialog({
   const [auto, setAuto] = useState(() => localStorage.getItem(AUTO_SYNC_KEY) !== "0");
   const [where, setWhere] = useState<Where | null>(null);
   const [removing, setRemoving] = useState(false);
-  const [tab, setTab] = useState<string>("backup");
+  const [tab, setTab] = useState<string>(initialTab);
   // A Google Drive sign-in or sync in progress keeps the dialog open, like a local backup does.
   const [driveBusy, setDriveBusy] = useState(false);
 
@@ -95,6 +101,13 @@ export function SyncDialog({
   };
   const useDefaultFolder = async () => {
     if (!where) return;
+    const ok = await confirmAction({
+      title: "Use the default folder?",
+      description: `The backup moves back to ${where.defaultPath}. In the next step you choose whether the files you have now are moved there too.`,
+      action: "Continue",
+      icon: <Undo2 className="size-4 text-muted-foreground" strokeWidth={1.5} />,
+    });
+    if (!ok) return;
     try {
       await propose(where.defaultPath);
     } catch (e) {
@@ -102,6 +115,14 @@ export function SyncDialog({
     }
   };
   const removePrevious = async () => {
+    const ok = await confirmAction({
+      title: "Remove the old backup folder?",
+      description: `${where?.previous ?? "The old folder"} moves to the Recycle Bin, so you can still bring it back from there. The backup you use now is not touched.`,
+      action: "Remove",
+      destructive: true,
+      icon: <Trash2 className="size-4 text-destructive" strokeWidth={1.5} />,
+    });
+    if (!ok) return;
     setRemoving(true);
     try {
       await invoke("delete_previous_backup");
@@ -115,6 +136,12 @@ export function SyncDialog({
   };
 
   const run = async (kind: "sync" | "restore") => {
+    const ok = await confirmAction(
+      kind === "sync"
+        ? { title: "Back up now?", description: `New and changed chats are copied into ${status?.path || "the backup folder"}. Nothing in the tools is changed.`, action: "Back up now", icon: <UploadCloud className="size-4 text-muted-foreground" strokeWidth={1.5} /> }
+        : { title: "Restore missing chats?", description: "Chats in the backup that are missing from their tools are copied back. Chats that are already there are never overwritten.", action: "Restore", icon: <RotateCcw className="size-4 text-muted-foreground" strokeWidth={1.5} /> },
+    );
+    if (!ok) return;
     setBusy(kind);
     setProg(null);
     try {
@@ -137,7 +164,7 @@ export function SyncDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !busy && !driveBusy && onOpenChange(o)}>
-      <DialogContent className="flex max-h-[min(88dvh,40rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
+      <DialogContent className="flex max-h-[min(88dvh,40rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
         <DialogHeader className="border-b px-5 py-3.5">
           <div className="flex items-center gap-3">
             <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
@@ -153,12 +180,13 @@ export function SyncDialog({
         <Tabs orientation="vertical" value={tab} onValueChange={(v) => setTab(String(v))} className="min-h-0 flex-1 flex-col gap-0 sm:flex-row">
           <ScrollArea className="shrink-0 border-b sm:w-52 sm:border-b-0 sm:border-r" viewportClassName="max-h-[min(70dvh,32rem)]">
             <TabsList variant="line" className="h-auto w-full flex-col items-stretch gap-0.5 p-2" aria-label="Sync and backup sections">
+              {/* Your backups first; then where and when they are made, the copy in Google Drive, and getting chats back. */}
               <RailLabel first>Backup</RailLabel>
+              <TabsTrigger value="backups" className={RAIL_TAB}>
+                <Archive className="size-4 shrink-0" strokeWidth={1.5} /> Backups
+              </TabsTrigger>
               <TabsTrigger value="backup" className={RAIL_TAB}>
                 <HardDrive className="size-4 shrink-0" strokeWidth={1.5} /> Backup folder
-              </TabsTrigger>
-              <TabsTrigger value="restore" className={RAIL_TAB}>
-                <RotateCcw className="size-4 shrink-0" strokeWidth={1.5} /> Restore
               </TabsTrigger>
               <TabsTrigger value="auto" className={RAIL_TAB}>
                 <RefreshCw className="size-4 shrink-0" strokeWidth={1.5} />
@@ -168,7 +196,10 @@ export function SyncDialog({
               <TabsTrigger value="drive" className={RAIL_TAB}>
                 <DriveLogo className="size-4 shrink-0" /> Google Drive
               </TabsTrigger>
-              <RailLabel>Files</RailLabel>
+              <RailLabel>Get chats back</RailLabel>
+              <TabsTrigger value="restore" className={RAIL_TAB}>
+                <RotateCcw className="size-4 shrink-0" strokeWidth={1.5} /> Restore
+              </TabsTrigger>
               <TabsTrigger value="export" className={RAIL_TAB}>
                 <FileDown className="size-4 shrink-0" strokeWidth={1.5} /> Export
               </TabsTrigger>
@@ -205,13 +236,16 @@ export function SyncDialog({
                           )}
                         </div>
                         <p className="mt-0.5 break-all font-mono text-xs text-muted-foreground">{status?.path || "…"}</p>
-                        {where && !where.isDefault && (
-                          <button type="button" disabled={!!busy} onClick={() => void useDefaultFolder()} className="mt-1 cursor-pointer text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline disabled:cursor-not-allowed disabled:opacity-50">
-                            Use the default folder instead
-                          </button>
-                        )}
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
+                        {where && !where.isDefault && (
+                          <Tooltip>
+                            <TooltipTrigger render={<Button variant="ghost" size="icon" className="size-8 text-muted-foreground" aria-label="Use the default folder" disabled={!!busy} onClick={() => void useDefaultFolder()} />}>
+                              <Undo2 className="size-4" strokeWidth={1.5} />
+                            </TooltipTrigger>
+                            <TooltipContent>Use the default folder</TooltipContent>
+                          </Tooltip>
+                        )}
                         <Button variant="ghost" size="icon" className="size-8 text-muted-foreground" aria-label="Open the backup folder" onClick={() => invoke("open_backup_folder").catch((e) => toast(String(e)))}>
                           <FolderOpen className="size-4" strokeWidth={1.5} />
                         </Button>
@@ -244,6 +278,10 @@ export function SyncDialog({
                     )}
                   </div>
                   {last && !busy && tab === "backup" && <p className="mt-3 rounded-lg border p-3 text-sm">{last}</p>}
+                </TabsContent>
+
+                <TabsContent value="backups">
+                  <BackupsPanel onChanged={onChanged} toast={toast} onBusy={setDriveBusy} />
                 </TabsContent>
 
                 <TabsContent value="restore">
@@ -292,7 +330,16 @@ export function SyncDialog({
                         <p className="text-sm font-medium">Export all chats as Markdown</p>
                         <p className="text-xs text-muted-foreground">One .md file per chat. Exporting again replaces them.</p>
                       </div>
-                      <Button variant="outline" className="shrink-0" disabled={exp.running} onClick={() => void startBulkExport()}>
+                      <Button variant="outline" className="shrink-0" disabled={exp.running} onClick={() =>
+                        void confirmAction({
+                          title: "Export all chats?",
+                          description: "Every chat is saved as a Markdown file, one file per chat. Exporting again replaces the files from the last export.",
+                          action: "Export",
+                          icon: <FileDown className="size-4 text-muted-foreground" strokeWidth={1.5} />,
+                        }).then((ok) => {
+                          if (ok) void startBulkExport();
+                        })
+                      }>
                         {exp.running ? <Loader2 className="size-4 animate-spin" /> : <FileDown className="size-4" />} {exp.running ? "Exporting" : "Export"}
                       </Button>
                     </div>
@@ -307,10 +354,13 @@ export function SyncDialog({
                   </div>
                 </TabsContent>
 
-                <div role="note" className="mt-5 flex items-start gap-2 rounded-lg bg-muted/40 p-3 text-xs text-muted-foreground">
-                  <Info className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.5} />
-                  <p>Backed-up chats stay visible after you sign out or reinstall.</p>
-                </div>
+                {/* The Backups and Google Drive tabs show this in their own note, merged with what they add. */}
+                {tab !== "backups" && tab !== "drive" && (
+                  <div role="note" className="mt-5 flex items-start gap-2 rounded-lg bg-muted/40 p-3 text-xs text-muted-foreground">
+                    <Info className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.5} />
+                    <p>Backed-up chats stay visible after you sign out or reinstall.</p>
+                  </div>
+                )}
               </div>
             </ScrollArea>
 

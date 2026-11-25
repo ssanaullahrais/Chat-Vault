@@ -226,11 +226,11 @@ export function OverviewPage({
           const name = PROVIDER_SHORT[tool];
           here = [
             { type: "label", label: `${name} · ${(overview[tool]?.total ?? 0).toLocaleString()} chats` },
-            { type: "item", label: `Show ${name} chats`, icon: <ProviderLogo provider={tool} className="size-4" />, onSelect: () => onShowTool(tool) },
-            { type: "item", label: `Open the latest ${name} chat`, icon: <History strokeWidth={1.5} />, onSelect: async () => { const c = await latest(tool); if (c) onOpenChat(c); } },
+            { type: "item", label: "Show these chats", icon: <ProviderLogo provider={tool} className="size-4" />, onSelect: () => onShowTool(tool) },
+            { type: "item", label: "Open latest", icon: <History strokeWidth={1.5} />, onSelect: async () => { const c = await latest(tool); if (c) onOpenChat(c); } },
             {
               type: "item",
-              label: `Resume the latest ${name} chat`,
+              label: "Resume latest",
               icon: <Play strokeWidth={1.5} />,
               onSelect: async () => {
                 const c = await latest(tool);
@@ -239,7 +239,7 @@ export function OverviewPage({
                 else notify(`${name} chats can't be resumed from here. Open the chat and use Actions.`);
               },
             },
-            { type: "item", label: "Copy the count", icon: <Copy strokeWidth={1.5} />, onSelect: copy(`${overview[tool]?.total ?? 0} ${name} chats`, "Count") },
+            { type: "item", label: "Copy count", icon: <Copy strokeWidth={1.5} />, onSelect: copy(`${overview[tool]?.total ?? 0} ${name} chats`, "Count") },
             { type: "sep" },
           ];
         } else if (ctx === "chart") {

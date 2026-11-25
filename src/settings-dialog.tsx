@@ -9,9 +9,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ProviderLogo } from "@/claude-logo";
-import { fmtSize, type Provider } from "@/chat-actions";
+import { fmtDate, fmtSize, type Provider } from "@/chat-actions";
 import { notifyError } from "@/toast";
 import { PanelHeader, RAIL_TAB, RailLabel } from "@/rail";
+import { DriveLogo, type DriveStatus } from "@/gdrive-panel";
 
 type Location = { label: string; path: string; isFile: boolean; exists: boolean; items: number | null; bytes: number | null };
 type Source = { provider: Provider; name: string; enabled: boolean; locations: Location[] };
@@ -48,12 +49,13 @@ export function SettingsDialog({
   open: boolean;
   onOpenChange: (o: boolean) => void;
   /** Opens Sync & backup, where the backup folder is changed. */
-  onOpenBackup: () => void;
+  onOpenBackup: (tab?: "backup" | "drive") => void;
   /** A tool was switched on or off: the lists are redrawn and re-read. */
   onToolsChanged: () => void | Promise<void>;
 }) {
   const [sources, setSources] = useState<Source[] | null>(null);
   const [backup, setBackup] = useState<Where | null>(null);
+  const [drive, setDrive] = useState<DriveStatus | null>(null);
   const [tab, setTab] = useState<string>("claude");
 
   const load = useCallback(() => {
@@ -65,6 +67,7 @@ export function SettingsDialog({
         notifyError(e);
       });
     invoke<Where>("backup_location_info").then(setBackup).catch(() => {});
+    invoke<DriveStatus>("gdrive_status").then(setDrive).catch(() => {});
   }, []);
   useEffect(() => {
     if (open) load();
@@ -156,6 +159,30 @@ export function SettingsDialog({
                   <Button variant="ghost" size="icon" className="size-7 shrink-0 text-muted-foreground" disabled={!backup?.available} aria-label="Open the backup folder" onClick={() => backup && void invoke("open_folder", { path: backup.path }).catch(notifyError)}>
                     <FolderOpen className="size-4" strokeWidth={1.5} />
                   </Button>
+                </div>
+                {/* Google Drive: where the backup also goes; it is set up in Sync & backup. */}
+                <div className="mt-3 flex min-w-0 items-center gap-3 rounded-lg border p-3">
+                  <DriveLogo className="size-5 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">Google Drive</span>
+                      {drive === null ? (
+                        <Skeleton className="h-4 w-20" />
+                      ) : (
+                        <Badge variant={drive.available && drive.connected ? "secondary" : "outline"} className="h-4 px-1.5 text-[10px] font-normal">
+                          {!drive.available ? "Not in this build" : drive.connected ? "Connected" : "Not connected"}
+                        </Badge>
+                      )}
+                    </div>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {drive?.connected ? `${drive.email ?? "Google account"}${drive.lastSyncMs ? ` · synced ${fmtDate(drive.lastSyncMs)}` : ""}` : "Back up to your own Drive and share chats between your PCs."}
+                    </p>
+                  </div>
+                  {drive?.available && (
+                    <Button variant="outline" size="sm" className="shrink-0" onClick={() => { onOpenChange(false); onOpenBackup("drive"); }}>
+                      {drive.connected ? "Manage…" : "Connect…"}
+                    </Button>
+                  )}
                 </div>
                 <div className="mt-3 flex items-center justify-between gap-3">
                   <p className="text-xs text-muted-foreground">Backed-up chats stay visible after you sign out or reinstall.</p>

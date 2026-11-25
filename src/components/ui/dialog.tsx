@@ -37,6 +37,22 @@ function DialogOverlay({
   )
 }
 
+/** Open dialogs, newest last. Only the newest is shown: one opened from another (even from a different part of the
+ *  app) hides the one behind it, and closing it shows that one again. Its backdrop stays, so the blur remains. */
+const stack: Array<(covered: boolean) => void> = []
+function TrackStack({ onCover }: { onCover: (covered: boolean) => void }) {
+  React.useEffect(() => {
+    stack[stack.length - 1]?.(true)
+    stack.push(onCover)
+    return () => {
+      const i = stack.indexOf(onCover)
+      if (i >= 0) stack.splice(i, 1)
+      stack[stack.length - 1]?.(false)
+    }
+  }, [onCover])
+  return null
+}
+
 function DialogContent({
   className,
   children,
@@ -45,11 +61,13 @@ function DialogContent({
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean
 }) {
+  const [covered, setCovered] = React.useState(false)
   return (
     <DialogPortal>
       <DialogOverlay />
       <DialogPrimitive.Popup
         data-slot="dialog-content"
+        data-covered={covered ? "" : undefined}
         className={cn(
           "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className
@@ -57,6 +75,7 @@ function DialogContent({
         {...props}
       >
         {children}
+        <TrackStack onCover={setCovered} />
         {showCloseButton && (
           <DialogPrimitive.Close
             data-slot="dialog-close"

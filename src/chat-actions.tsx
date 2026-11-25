@@ -77,10 +77,12 @@ export type Chat = {
   userArchived?: boolean;
 };
 export type Msg = {
-  role: "user" | "assistant";
+  /** "system" is a note from the AI app itself (see the "notice" kind). */
+  role: "user" | "assistant" | "system";
   ts: string;
   text: string;
-  kind: "text" | "tool" | "summary" | "image" | "result" | "reasoning";
+  /** "notice": a note the AI app shows in the conversation (command output, compaction, an error, an unknown entry). */
+  kind: "text" | "tool" | "summary" | "image" | "result" | "reasoning" | "notice";
   id?: string;
   name?: string;
   data?: Record<string, unknown> | string;

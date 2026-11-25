@@ -125,7 +125,7 @@ fn gemini_messages(p: &Path) -> Vec<Msg> {
                     let mut tool = Msg::new("assistant", &ts, format!("{}:", name), "tool");
                     tool.name = Some(name);
                     tool.id = id.clone();
-                    tool.data = call.get("args").cloned();
+                    tool.data = call.get("args").cloned(); { let inp = tool.data.clone(); crate::providers::annotate(&mut tool, inp.as_ref()); }
                     out.push(tool);
                     let result = call.get("resultDisplay").and_then(|r| r.as_str()).map(String::from).or_else(|| call.get("result").map(|r| clip(&r.to_string(), 4000)));
                     if let Some(r) = result.filter(|r| !r.trim().is_empty()) {
@@ -138,12 +138,16 @@ fn gemini_messages(p: &Path) -> Vec<Msg> {
             "error" => {
                 let t = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 if !t.trim().is_empty() {
-                    let mut e = Msg::new("assistant", &ts, t.to_string(), "text");
-                    e.error = Some(true);
-                    out.push(e);
+                    out.push(crate::providers::notice(&ts, "error", t, true));
                 }
             }
-            _ => {}
+            // Gemini CLI's own notes ("Update successful", warnings) and any kind added later: shown as notes, never dropped.
+            other => {
+                let t = crate::providers::text_of(&m);
+                if !t.is_empty() {
+                    out.push(crate::providers::notice(&ts, other, &t, other == "warning"));
+                }
+            }
         }
     }
     out
@@ -374,7 +378,7 @@ fn opencode_v2_messages(c: &Connection, id: &str) -> Option<Vec<Msg>> {
                             tool.name = Some(name);
                             tool.id = cid.clone();
                             let state = p.get("state").cloned().unwrap_or(Value::Null);
-                            tool.data = state.get("input").cloned();
+                            tool.data = state.get("input").cloned(); { let inp = tool.data.clone(); crate::providers::annotate(&mut tool, inp.as_ref()); }
                             out.push(tool);
                             if let Some(o) = opencode_v2_tool_output(&state) {
                                 let mut res = Msg::new("assistant", &ts, clip(&o, 8000), "result");
@@ -439,15 +443,37 @@ fn opencode_messages(key: &str) -> Vec<Msg> {
                     let mut tool = Msg::new("assistant", &ts, format!("{}:", name), "tool");
                     tool.name = Some(name);
                     tool.id = cid.clone();
-                    tool.data = p.get("state").and_then(|s| s.get("input")).cloned();
+                    tool.data = p.get("state").and_then(|s| s.get("input")).cloned(); { let inp = tool.data.clone(); crate::providers::annotate(&mut tool, inp.as_ref()); }
                     out.push(tool);
                     if let Some(o) = p.get("state").and_then(|s| s.get("output")).and_then(|o| o.as_str()).filter(|o| !o.trim().is_empty()) {
                         let mut res = Msg::new("assistant", &ts, clip(o, 8000), "result");
                         res.id = cid;
+                        // OpenCode marks a failed tool with status "error".
+                        if p.get("state").and_then(|s| s.get("status")).and_then(|s| s.as_str()) == Some("error") {
+                            res.error = Some(true);
+                        }
+                        out.push(res);
+                    } else if let Some(e) = p.get("state").filter(|s| s.get("status").and_then(|x| x.as_str()) == Some("error")).and_then(|s| s.get("error")).and_then(|e| e.as_str()) {
+                        let mut res = Msg::new("assistant", &ts, clip(e, 8000), "result");
+                        res.id = cid;
+                        res.error = Some(true);
                         out.push(res);
                     }
                 }
-                _ => {}
+                "file" => {
+                    let name = p.get("filename").or(p.get("url")).and_then(|x| x.as_str()).unwrap_or("a file");
+                    out.push(crate::providers::notice(&ts, "attachment", &format!("Attached {name}"), false));
+                }
+                "compaction" => out.push(crate::providers::notice(&ts, "compact", "Conversation compacted", false)),
+                // OpenCode's own bookkeeping, not shown in its app either.
+                "step-start" | "step-finish" | "snapshot" | "patch" | "agent" | "retry" => {}
+                // A part type added later: shown as a note with its text, never dropped.
+                other => {
+                    let t = crate::providers::text_of(&p);
+                    if !t.is_empty() {
+                        out.push(crate::providers::notice(&ts, other, &t, false));
+                    }
+                }
             }
         }
     }
@@ -562,7 +588,7 @@ fn cline_messages(p: &Path) -> Vec<Msg> {
                     let mut tool = Msg::new("assistant", &ts, format!("{}:", name), "tool");
                     tool.name = Some(name);
                     tool.id = b.get("id").and_then(|n| n.as_str()).map(String::from);
-                    tool.data = b.get("input").cloned();
+                    tool.data = b.get("input").cloned(); { let inp = tool.data.clone(); crate::providers::annotate(&mut tool, inp.as_ref()); }
                     out.push(tool);
                 }
                 "tool_result" => {

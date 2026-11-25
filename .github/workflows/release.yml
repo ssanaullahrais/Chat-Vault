@@ -57,6 +57,33 @@ jobs:
           releaseDraft: false
           prerelease: false
 
+      # The release notes: this version's section of CHANGELOG.md, followed by the download list.
+      - name: Write the release notes from CHANGELOG.md
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]" | Select-Object -First 1).LineNumber
+          if (-not $start) { Write-Host "No CHANGELOG.md section for $version; keeping the default notes."; exit 0 }
+          $notes = @()
+          for ($i = $start; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## ') { break }
+            $notes += $lines[$i]
+          }
+          $body = @(
+            "## ChatVault ${{ github.ref_name }}", "",
+            ($notes -join "`n").Trim(), "",
+            "**Download**",
+            '- `ChatVault_*_x64-setup.exe`: the installer (recommended)',
+            '- `ChatVault_*_x64_en-US.msi`: Windows Installer package',
+            '- `ChatVault_*_x64-portable.exe`: runs without installing', "",
+            "Installed copies of ChatVault update themselves from this release. Every change: [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)."
+          ) -join "`n"
+          Set-Content -Path release-notes.md -Value $body -Encoding utf8
+          gh release edit "${{ github.ref_name }}" --notes-file release-notes.md --repo "${{ github.repository }}"
+
       - name: Attach the portable exe
         shell: pwsh
         env:
