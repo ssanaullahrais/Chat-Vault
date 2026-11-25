@@ -9,6 +9,12 @@ lerna-debug.log*
 
 node_modules
 dist
+
+# Google OAuth credentials for local builds (see .env.example and docs/GOOGLE_DRIVE_SETUP.md). Never commit them.
+.env
+.env.*
+!.env.example
+client_secret*.json
 dist-ssr
 *.local
 

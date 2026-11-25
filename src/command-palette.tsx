@@ -1,12 +1,10 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Command, CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator, CommandShortcut } from "@/components/ui/command";
 import { ProviderLogo } from "@/claude-logo";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { PROVIDERS, PROVIDER_SHORT, type Chat, type Provider } from "@/chat-actions";
-
-type Hit = { id: string; snippet: string };
+import { PROVIDERS, PROVIDER_SHORT, type Chat, type Found, type Provider } from "@/chat-actions";
 
 export type PaletteAction = { id: string; label: string; icon: ReactNode; shortcut?: string; run: () => void };
 
@@ -18,6 +16,7 @@ export function CommandPalette({
   pinned,
   titleOf,
   onOpenChat,
+  renamed,
   actions,
 }: {
   open: boolean;
@@ -25,13 +24,17 @@ export function CommandPalette({
   provider: Provider;
   pinned: Chat[];
   titleOf: (c: Chat) => string;
-  onOpenChat: (c: Chat) => void;
+  onOpenChat: (c: Chat, term: string) => void;
+  /** Names given to chats in ChatVault, searched as titles. */
+  renamed: Record<string, string>;
   actions: PaletteAction[];
 }) {
   const [value, setValue] = useState("");
   const [results, setResults] = useState<Chat[]>([]);
   const [loading, setLoading] = useState(false);
   const [snippets, setSnippets] = useState<Record<string, string>>({});
+  const renamedRef = useRef(renamed);
+  renamedRef.current = renamed;
 
   useEffect(() => {
     if (!open) {
@@ -43,34 +46,25 @@ export function CommandPalette({
     const q = value.trim();
     const t = window.setTimeout(async () => {
       try {
-        // Same search as the sidebar: titles and projects, plus the words inside chats from the search index.
+        if (q.length >= 2) {
+          // Same ranked search as the sidebar and the search page.
+          const found = await invoke<Found[]>("search_chats", { query: q, renamed: renamedRef.current, includeArchived: false, limit: 12 });
+          if (stale) return;
+          const snips: Record<string, string> = {};
+          found.forEach((f) => f.snippet && (snips[`${f.chat.provider}:${f.chat.id}`] = f.snippet));
+          setResults(found.map((f) => f.chat));
+          setSnippets(snips);
+          return;
+        }
+        // Nothing (or one letter) typed: the newest chats, and titles for a single letter.
         const per = await Promise.all(
-          PROVIDERS.map(async (p) => {
-            const [titles, words] = await Promise.all([
-              invoke<{ items: Chat[] }>("query_chats", { provider: p, account: "all", q, offset: 0, limit: q ? 30 : 8, sort: "recent", scope: "all" }).then((r) => r.items).catch(() => [] as Chat[]),
-              q.length >= 2 ? invoke<Hit[]>("deep_search", { provider: p, query: q }).catch(() => [] as Hit[]) : Promise.resolve([] as Hit[]),
-            ]);
-            const inside = words.length ? await invoke<Chat[]>("chats_by_ids", { provider: p, ids: words.slice(0, 20).map((h) => h.id) }).catch(() => [] as Chat[]) : [];
-            return { titles, inside, words };
-          }),
+          PROVIDERS.map((p) =>
+            invoke<{ items: Chat[] }>("query_chats", { provider: p, account: "all", q, offset: 0, limit: 8, sort: "recent", scope: "all" }).then((r) => r.items).catch(() => [] as Chat[]),
+          ),
         );
         if (stale) return;
-        const found: Record<string, string> = {};
-        const seen = new Set<string>();
-        const list: Chat[] = [];
-        per.forEach(({ titles, inside, words }) => {
-          words.forEach((h) => (found[h.id] = h.snippet));
-          [...titles, ...inside].forEach((c) => {
-            const k = `${c.provider}:${c.id}`;
-            if (!seen.has(k)) {
-              seen.add(k);
-              list.push(c);
-            }
-          });
-        });
-        list.sort((x, y) => y.lastMs - x.lastMs);
-        setResults(list.slice(0, 12));
-        setSnippets(found);
+        setResults(per.flat().sort((x, y) => y.lastMs - x.lastMs).slice(0, 12));
+        setSnippets({});
       } catch {
         if (!stale) setResults([]);
       } finally {
@@ -92,11 +86,11 @@ export function CommandPalette({
   const shownPinned = pinned.filter((c) => !q || titleOf(c).toLowerCase().includes(q));
 
   const item = (c: Chat) => (
-    <CommandItem key={`${c.provider}:${c.id}`} value={`${c.provider}:${c.id}`} onSelect={() => select(() => onOpenChat(c))}>
+    <CommandItem key={`${c.provider}:${c.id}`} value={`${c.provider}:${c.id}`} onSelect={() => select(() => onOpenChat(c, value.trim().length >= 2 ? value.trim() : ""))}>
       <ProviderLogo provider={c.provider} className="size-4 shrink-0" />
       <span className="min-w-0 flex-1">
         <span className="block truncate">{titleOf(c)}</span>
-        {q && snippets[c.id] && <span className="block truncate text-xs text-muted-foreground">{snippets[c.id].replace(/<[^>]+>/g, "")}</span>}
+        {q && snippets[`${c.provider}:${c.id}`] && <span className="block truncate text-xs text-muted-foreground">{snippets[`${c.provider}:${c.id}`]}</span>}
       </span>
     </CommandItem>
   );

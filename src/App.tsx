@@ -51,7 +51,7 @@ import { AppLogo, ProviderLogo, ProviderStack } from "@/claude-logo";
 import { Badge } from "@/components/ui/badge";
 import { ActionIcon } from "@/action-icon";
 import { ChatCard } from "@/chat-card";
-import { CORE_PROVIDERS, PROVIDERS, setOffTools, setCustomAccountNames, originalAccountLabel, type Tool, PROVIDER_NAME, isHandoffOnly, deleteKind, deleteBlockedMessage, accountLabel, chatActions, continueTargets, COPY_CONTENT_IDS, prettyProject, setAccountNames, type AccountInfo, type Chat, type ChatAction, type Msg, type MsgPage, type Provider } from "@/chat-actions";
+import { CORE_PROVIDERS, PROVIDERS, setOffTools, setCustomAccountNames, originalAccountLabel, type Tool, PROVIDER_NAME, isHandoffOnly, deleteKind, deleteBlockedMessage, accountLabel, chatActions, continueTargets, COPY_CONTENT_IDS, prettyProject, setAccountNames, type AccountInfo, type Chat, type ChatAction, type Found, type Msg, type MsgPage, type Provider } from "@/chat-actions";
 import { FadedScroll } from "@/faded-scroll";
 import {
   DropdownMenu,
@@ -67,6 +67,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { SidebarSkeleton, MessagesSkeleton } from "@/skeletons";
 import { Splash } from "@/splash";
+import type { DriveStats, DriveStatus } from "@/gdrive-panel";
 import { TitleBar } from "@/titlebar";
 import { AUTO_SYNC_KEY } from "@/store";
 import { chatKey, useAccountNames, useChatMeta, usePersisted } from "@/store";
@@ -88,7 +89,6 @@ const PAGE_SIZE = 20;
 const MSG_PAGE = 80;
 
 type Overview = { total: number; accounts: { id: string; count: number }[]; latestMs: number | null };
-type Hit = { id: string; snippet: string };
 type IndexProg = { phase: string; done: number; total: number };
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -113,6 +113,9 @@ export default function App() {
   const [recentOpen, setRecentOpen] = usePersisted("chatvault.sec.recent", true);
   const [dark, setDark] = useState(() => localStorage.getItem("theme") !== "light");
   const { pins, names, togglePin, rename } = useChatMeta();
+  // Read by searches without making them run again on every rename.
+  const namesRef = useRef(names);
+  namesRef.current = names;
   const { accountNames, renameAccount } = useAccountNames();
   setCustomAccountNames(accountNames);
   const [renamingAccount, setRenamingAccount] = useState<string | null>(null);
@@ -149,6 +152,8 @@ export default function App() {
   const [hits, setHits] = useState<Record<string, string> | null>(null);
   const [searching, setSearching] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  // Bumped after a background refresh: pinned chats, counts and search results follow, while the list keeps its place.
+  const [liveTick, setLiveTick] = useState(0);
   const [indexing, setIndexing] = useState<IndexProg | null>(null);
   const [selected, setSelected] = useState<Chat | null>(null);
   const [page, setPageState] = useState<MsgPage | null>(null);
@@ -243,17 +248,31 @@ export default function App() {
     if (!isTauri) return;
     const un = listen<IndexProg>("index-progress", (e) => setIndexing(e.payload.phase === "Done" ? null : e.payload));
     let cancelled = false;
+    // Google Drive, when connected and set to sync automatically. It runs quietly: offline or failing, the app carries on
+    // and Sync & backup shows what went wrong. Chats that arrived from other PCs are added to the list.
+    const driveSync = async () => {
+      const s = await invoke<DriveStatus>("gdrive_status").catch(() => null);
+      if (cancelled || !s?.connected || !s.autoSync || s.busy) return;
+      const r = await invoke<DriveStats>("gdrive_sync", { restore: false }).catch(() => null);
+      if (!cancelled && r && (r.downloaded > 0 || r.conflicts > 0)) await rescan();
+    };
     // Paint cached chats first; StrictMode cleanup cancels the first scheduled run.
     const startup = window.setTimeout(() => {
       void (async () => {
         await rescan();
-        if (cancelled || localStorage.getItem(AUTO_SYNC_KEY) === "0") return;
-        const result = await invoke<{ copied: number }>("sync_chats").catch(() => null);
-        if (!cancelled && result && result.copied > 0) await rescan();
+        if (cancelled) return;
+        if (localStorage.getItem(AUTO_SYNC_KEY) !== "0") {
+          const result = await invoke<{ copied: number }>("sync_chats").catch(() => null);
+          if (!cancelled && result && result.copied > 0) await rescan();
+        }
+        await driveSync();
       })();
     }, 750);
     const every = window.setInterval(() => {
-      if (localStorage.getItem(AUTO_SYNC_KEY) !== "0") void invoke("sync_chats").then(() => rescan()).catch(() => {});
+      void (async () => {
+        if (localStorage.getItem(AUTO_SYNC_KEY) !== "0") await invoke("sync_chats").then(() => rescan()).catch(() => {});
+        await driveSync();
+      })();
     }, 10 * 60 * 1000);
     const stopUpdates = startAutoUpdate();
     const offSync = listen("tray-sync", () => setSyncOpen(true));
@@ -280,7 +299,7 @@ export default function App() {
         .then((o) => setOverview((s) => ({ ...s, [p]: o })))
         .catch(() => {}),
     );
-  }, [reloadKey]);
+  }, [reloadKey, liveTick]);
 
   // Pinned chats of the current tool.
   useEffect(() => {
@@ -298,7 +317,7 @@ export default function App() {
     Promise.all([...byTool].map(([p, ids]) => invoke<Chat[]>("chats_by_ids", { provider: p, ids }).catch(() => [] as Chat[])))
       .then((lists) => setPinned(lists.flat().sort((a, b) => b.lastMs - a.lastMs)))
       .catch(() => {});
-  }, [pins, provider, reloadKey]);
+  }, [pins, provider, reloadKey, liveTick]);
 
   // First page of the list whenever the tool, account, search or index changes.
   const searchingAll = q.length >= 2;
@@ -328,36 +347,18 @@ export default function App() {
     setSearching(true);
     void (async () => {
       try {
-        const per = await Promise.all(
-          PROVIDERS.map(async (p) => {
-            const [titles, words] = await Promise.all([
-              invoke<{ items: Chat[] }>("query_chats", { provider: p, account: "all", q, offset: 0, limit: 30, sort: "recent", scope: "all" }).then((r) => r.items).catch(() => [] as Chat[]),
-              invoke<Hit[]>("deep_search", { provider: p, query: q }).catch(() => [] as Hit[]),
-            ]);
-            const inside = words.length ? await invoke<Chat[]>("chats_by_ids", { provider: p, ids: words.slice(0, 40).map((h) => h.id) }).catch(() => [] as Chat[]) : [];
-            return { titles, inside, words };
-          }),
-        );
+        // One ranked search over every tool: titles (including names you gave chats here), projects and the words inside.
+        const found = await invoke<Found[]>("search_chats", { query: q, renamed: namesRef.current, includeArchived: false, limit: 150 });
         if (stale) return;
         const snippets: Record<string, string> = {};
-        const seen = new Set<string>();
-        const list: Chat[] = [];
-        per.forEach(({ titles, inside, words }) => {
-          words.forEach((h) => (snippets[h.id] = h.snippet));
-          [...titles, ...inside].forEach((c) => {
-            const k = chatKey(c);
-            if (!seen.has(k)) {
-              seen.add(k);
-              list.push(c);
-            }
-          });
-        });
-        list.sort((x, y) => y.lastMs - x.lastMs);
-        setItems(list);
-        setTotal(list.length);
+        found.forEach((f) => f.snippet && (snippets[f.chat.id] = f.snippet));
+        setItems(found.map((f) => f.chat));
+        setTotal(found.length);
         setHits(snippets);
         setError(null);
         setLoadingList(false);
+      } catch (e) {
+        if (!stale) setError(String(e));
       } finally {
         if (!stale) setSearching(false);
       }
@@ -365,19 +366,26 @@ export default function App() {
     return () => {
       stale = true;
     };
-  }, [q, searchingAll, reloadKey]);
+  }, [q, searchingAll, reloadKey, liveTick]);
 
+  // "Getting your chats ready…" stays up from the very start until the first list of chats is on screen,
+  // so the app never shows an empty or half-loaded sidebar. If loading takes unusually long it steps aside after 8 seconds.
+  const listReady = !loadingList || !isTauri;
+  const [splashTimedOut, setSplashTimedOut] = useState(false);
   useEffect(() => {
-    let timer: number | undefined;
-    const frame = requestAnimationFrame(() => {
-      setSplash("leaving");
-      timer = window.setTimeout(() => setSplash("off"), 320);
-    });
-    return () => {
-      cancelAnimationFrame(frame);
-      window.clearTimeout(timer);
-    };
+    const t = window.setTimeout(() => setSplashTimedOut(true), 8000);
+    return () => window.clearTimeout(t);
   }, []);
+  useEffect(() => {
+    if (splash !== "on" || !(listReady || splashTimedOut)) return;
+    const frame = requestAnimationFrame(() => setSplash("leaving"));
+    return () => cancelAnimationFrame(frame);
+  }, [splash, listReady, splashTimedOut]);
+  useEffect(() => {
+    if (splash !== "leaving") return;
+    const timer = window.setTimeout(() => setSplash("off"), 320);
+    return () => window.clearTimeout(timer);
+  }, [splash]);
 
   const loadingMore = useRef(false);
   const loadMore = useCallback(async () => {
@@ -415,9 +423,12 @@ export default function App() {
 
   const openId = useRef(0);
   const [outline, setOutline] = useState<{ ts: string; text: string }[] | null>(null);
+  // What was searched for when a chat was opened from search results: the chat opens with those words highlighted.
+  const [openQuery, setOpenQuery] = useState("");
   const open = useCallback(
-    (chat: Chat) => {
+    (chat: Chat, query = "") => {
       const id = ++openId.current;
+      setOpenQuery(query);
       setSearchAll(false);
       setSelected(chat);
       setPage(null);
@@ -507,6 +518,8 @@ export default function App() {
   listArgs.current = { provider, account, q, sort, scope, count: items.length };
   const quietReload = useCallback(async () => {
     const l = listArgs.current;
+    // While a search is shown, the search itself is run again (it follows liveTick) instead of replacing its results.
+    if (l.q.length >= 2) return;
     const r = await invoke<{ items: Chat[]; total: number }>("query_chats", { provider: l.provider, account: l.account, q: l.q, offset: 0, limit: Math.min(300, Math.max(PAGE_SIZE, l.count)), sort: l.sort, scope: l.scope });
     setItems(r.items);
     setTotal(r.total);
@@ -515,6 +528,8 @@ export default function App() {
   const cursorChanged = useRef(0);
   const filesFp = useRef<[number, number] | null>(null);
   const lastRefresh = useRef(0);
+  // A change seen but not yet applied. It is never dropped: it waits for the next allowed refresh.
+  const changePending = useRef(false);
   useEffect(() => {
     if (!isTauri) return;
     let busy = false;
@@ -526,15 +541,27 @@ export default function App() {
         const cursorMoved = cursorFp.current !== 0 && fp !== cursorFp.current;
         const prev = filesFp.current;
         const fresh = !!prev && ff[0] !== prev[0];
-        const grew = !!prev && ff[1] !== prev[1] && Date.now() - lastRefresh.current > 15000;
+        if (prev && (ff[0] !== prev[0] || ff[1] !== prev[1])) changePending.current = true;
         cursorFp.current = fp;
         filesFp.current = ff;
         if (cursorMoved) cursorChanged.current = Date.now();
-        if (cursorMoved || fresh || grew) {
+        // New chats and Cursor changes are applied at once; changes inside existing chats and renames at most every 4 seconds.
+        const due = changePending.current && Date.now() - lastRefresh.current > 4000;
+        if (cursorMoved || fresh || due) {
           lastRefresh.current = Date.now();
+          changePending.current = false;
           await invoke("refresh_index");
           void invoke("build_search_index").catch(() => {});
           await quietReload();
+          setLiveTick((n) => n + 1);
+          // The open chat's header follows a rename made in its own tool.
+          const shownChat = selRef.current;
+          if (shownChat) {
+            const [latest] = await invoke<Chat[]>("chats_by_ids", { provider: shownChat.provider, ids: [shownChat.id] }).catch(() => [] as Chat[]);
+            if (latest && selRef.current?.id === shownChat.id && selRef.current.provider === shownChat.provider && latest.title !== selRef.current.title) {
+              setSelected((s) => (s && s.id === latest.id && s.provider === latest.provider ? { ...s, title: latest.title } : s));
+            }
+          }
           const sel = selRef.current;
           const cur = pageRef.current;
           if (cursorMoved && sel?.provider === "cursor" && cur && !cur.partial) {
@@ -731,7 +758,11 @@ export default function App() {
   const lq = q.toLowerCase();
   const pinnedShown = pinned.filter((c) => !lq || named(c).title.toLowerCase().includes(lq) || c.project.toLowerCase().includes(lq));
   const recent = useMemo(() => items.filter((c) => !pinSet.has(chatKey(c))), [items, pinSet]);
-  const dayGroups = useMemo(() => groupChatsByDay(recent), [recent, calendarDay]);
+  // While searching, results stay in one list in the order the search ranked them (best match first), not split by day.
+  const dayGroups = useMemo(
+    () => (searchingAll ? { today: [] as Chat[], yesterday: [] as Chat[], recent } : groupChatsByDay(recent)),
+    [recent, calendarDay, searchingAll],
+  );
   const projectGroups = useMemo(() => groupByProject(recent), [recent]);
   const projectNames = useMemo(() => projectGroups.map(([name]) => name), [projectGroups]);
   const allProjectsClosed = projectNames.length > 0 && projectNames.every((n) => !projectOpen(n));
@@ -830,10 +861,10 @@ export default function App() {
   ];
 
   // Stable wrappers around the latest closures, so a card only re-renders when its own data changes.
-  const latest = useRef({ extras, open });
-  latest.current = { extras, open };
+  const latest = useRef({ extras, open, found: "" });
+  latest.current = { extras, open, found: searchingAll ? q : "" };
   const getExtras = useCallback((c: Chat) => latest.current.extras(c), []);
-  const openChat = useCallback((c: Chat) => latest.current.open(c), []);
+  const openChat = useCallback((c: Chat) => latest.current.open(c, latest.current.found), []);
 
   const row = (c: Chat, inProject = false) => (
     <ChatRow
@@ -843,6 +874,7 @@ export default function App() {
       pinned={pinSet.has(chatKey(c))}
       live={liveKeys.has(chatKey(c))}
       hit={hits?.[c.id]}
+      hitQuery={searchingAll ? q : undefined}
       inProject={inProject}
       msgs={selected?.id === c.id ? msgs : null}
       getExtras={getExtras}
@@ -1018,7 +1050,7 @@ export default function App() {
                 </Section>
               )}
               <Section
-                title="Recent"
+                title={searchingAll ? "Best matches" : "Recent"}
                 count={dayGroups.recent.length}
                 open={recentOpen}
                 onOpenChange={setRecentOpen}
@@ -1087,12 +1119,13 @@ export default function App() {
             <GlobalSearch
               key={searchSeed}
               initial={searchSeed}
+              renamed={names}
               titleOf={(c) => named(c).title}
               onClose={() => setSearchAll(false)}
-              onOpenChat={(c) => {
+              onOpenChat={(c, term) => {
                 setSearchAll(false);
                 if (c.provider !== provider) setProvider(c.provider);
-                open(c);
+                open(c, term);
               }}
             />
           ) : !selected ? (
@@ -1121,6 +1154,7 @@ export default function App() {
             <ChatView
               key={chatKey(selected)}
               chat={named(selected)}
+              initialSearch={openQuery}
               page={page}
               loadingEarlier={loadingEarlier}
               live={live}
@@ -1154,9 +1188,10 @@ export default function App() {
           provider={provider === "all" ? "claude" : provider}
           pinned={pinned}
           titleOf={(c) => named(c).title}
-          onOpenChat={(c) => {
+          renamed={names}
+          onOpenChat={(c, term) => {
             if (c.provider !== provider) setProvider(c.provider);
-            open(c);
+            open(c, term);
           }}
           actions={[
             { id: "overview", label: "Back to Home", icon: <LayoutDashboard className="size-4" />, run: () => setSelected(null) },
@@ -1362,6 +1397,7 @@ const ChatRow = memo(function ChatRow({
   pinned,
   live,
   hit,
+  hitQuery,
   inProject,
   msgs,
   getExtras,
@@ -1373,6 +1409,7 @@ const ChatRow = memo(function ChatRow({
   pinned: boolean;
   live?: boolean;
   hit?: string;
+  hitQuery?: string;
   inProject?: boolean;
   msgs: Msg[] | null;
   getExtras: (c: Chat) => ChatAction[];
@@ -1390,6 +1427,7 @@ const ChatRow = memo(function ChatRow({
       }}
       live={live}
       hit={hit}
+      hitQuery={hitQuery}
       inProject={inProject}
       onOpen={() => onOpen(chat)}
       menu={<ChatMenu chat={chat} toast={toast} msgs={msgs} getExtras={() => getExtras(chat)} />}

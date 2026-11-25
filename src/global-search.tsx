@@ -7,7 +7,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { FadedScroll } from "@/faded-scroll";
 import { ProviderLogo } from "@/claude-logo";
 import { Highlight } from "@/highlight";
-import { PROVIDERS, PROVIDER_NAME, PROVIDER_SHORT, fmtDate, type Chat, type Provider } from "@/chat-actions";
+import { PROVIDERS, PROVIDER_NAME, PROVIDER_SHORT, fmtDate, type Chat, type Found, type Provider } from "@/chat-actions";
 import { cn } from "@/lib/utils";
 
 type Hit = { chat: Chat; snippet: string };
@@ -24,7 +24,22 @@ const loadRecent = (): string[] => {
 };
 
 /** Search the words inside every chat of every tool. Results from each tool appear as soon as that tool has been searched. */
-export function GlobalSearch({ onOpenChat, onClose, titleOf, initial = "" }: { onOpenChat: (c: Chat) => void; onClose: () => void; titleOf: (c: Chat) => string; initial?: string }) {
+export function GlobalSearch({
+  onOpenChat,
+  onClose,
+  titleOf,
+  renamed,
+  initial = "",
+}: {
+  onOpenChat: (c: Chat, term: string) => void;
+  onClose: () => void;
+  titleOf: (c: Chat) => string;
+  /** Names given to chats in ChatVault ("provider:id" → name), searched as titles. */
+  renamed: Record<string, string>;
+  initial?: string;
+}) {
+  const renamedRef = useRef(renamed);
+  renamedRef.current = renamed;
   const [q, setQ] = useState(initial);
   const [hits, setHits] = useState<Record<Provider, Hit[]>>(none());
   const [busy, setBusy] = useState<Provider[]>([]);
@@ -55,24 +70,22 @@ export function GlobalSearch({ onOpenChat, onClose, titleOf, initial = "" }: { o
       return;
     }
     const id = ++run.current;
-    const t = window.setTimeout(() => {
-      setHits(none());
+    const t = window.setTimeout(async () => {
       setBusy([...PROVIDERS]);
       setSearched(term);
-      PROVIDERS.forEach(async (p) => {
-        try {
-          const found = await invoke<{ id: string; snippet: string }[]>("deep_search", { provider: p, query: term });
-          const chats = found.length ? await invoke<Chat[]>("chats_by_ids", { provider: p, ids: found.map((h) => h.id) }) : [];
-          const by = new Map(chats.map((c) => [c.id, c]));
-          const list = found.flatMap((h) => (by.has(h.id) ? [{ chat: by.get(h.id)!, snippet: h.snippet }] : []));
-          if (run.current === id) setHits((s) => ({ ...s, [p]: list }));
-        } catch {
-          /* that tool could not be searched */
-        } finally {
-          if (run.current === id) setBusy((b) => b.filter((x) => x !== p));
-        }
-      });
-    }, 350);
+      try {
+        // One ranked search over every tool; best matches first within each tool.
+        const found = await invoke<Found[]>("search_chats", { query: term, renamed: renamedRef.current, includeArchived: true, limit: 500 });
+        if (run.current !== id) return;
+        const next = none();
+        found.forEach((f) => next[f.chat.provider]?.push({ chat: f.chat, snippet: f.snippet }));
+        setHits(next);
+      } catch {
+        if (run.current === id) setHits(none());
+      } finally {
+        if (run.current === id) setBusy([]);
+      }
+    }, 250);
     return () => window.clearTimeout(t);
   }, [q]);
 
@@ -86,7 +99,7 @@ export function GlobalSearch({ onOpenChat, onClose, titleOf, initial = "" }: { o
 
   const open = (c: Chat) => {
     if (searched) remember(searched);
-    onOpenChat(c);
+    onOpenChat(c, searched);
   };
 
   return (
@@ -96,7 +109,7 @@ export function GlobalSearch({ onOpenChat, onClose, titleOf, initial = "" }: { o
           <div className="flex items-start justify-between gap-4">
             <div>
               <h2 className="text-lg font-semibold tracking-tight">Search all chats</h2>
-              <p className="text-sm text-muted-foreground">Find any word inside every chat, from every tool.</p>
+              <p className="text-sm text-muted-foreground">Find any word inside every chat, from every tool. Use "quotes" for an exact phrase, -word to leave a word out, and OR for either word.</p>
             </div>
             <Button variant="ghost" size="icon" aria-label="Close search" className="-mr-2 -mt-1 text-muted-foreground" onClick={onClose}>
               <X className="size-4" />
@@ -193,7 +206,7 @@ export function GlobalSearch({ onOpenChat, onClose, titleOf, initial = "" }: { o
                   ))}
                 </div>
                 <p className="text-sm font-medium">Search the words inside every chat</p>
-                <p className="max-w-md text-xs text-muted-foreground">Claude Code, Codex, Cursor, Gemini CLI, OpenCode and Cline are searched together. Results appear as soon as each tool has answered.</p>
+                <p className="max-w-md text-xs text-muted-foreground">Claude Code, Codex, Cursor, Gemini CLI, OpenCode and Cline are searched together, best matches first.</p>
               </div>
             </div>
           )}
@@ -231,16 +244,22 @@ export function GlobalSearch({ onOpenChat, onClose, titleOf, initial = "" }: { o
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="flex items-baseline gap-3">
-                        <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{titleOf(h.chat)}</span>
+                        <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
+                          <Highlight text={titleOf(h.chat)} q={searched} activeMark={false} />
+                        </span>
                         <span className="shrink-0 text-xs text-muted-foreground">{fmtDate(h.chat.lastMs)}</span>
                       </span>
                       <span className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
                         <FolderOpen className="size-3 shrink-0" strokeWidth={1.5} />
                         <span className="truncate">{h.chat.project}</span>
                       </span>
-                      <span className="mt-1.5 line-clamp-2 block text-[13px] leading-relaxed text-muted-foreground">
-                        <Highlight text={h.snippet} q={searched} activeMark={false} />
-                      </span>
+                      {h.snippet ? (
+                        <span className="mt-1.5 line-clamp-2 block text-[13px] leading-relaxed text-muted-foreground">
+                          <Highlight text={h.snippet} q={searched} activeMark={false} />
+                        </span>
+                      ) : (
+                        <span className="mt-1.5 block text-xs text-muted-foreground">Found in the title.</span>
+                      )}
                     </span>
                   </button>
                 ))}
@@ -254,7 +273,7 @@ export function GlobalSearch({ onOpenChat, onClose, titleOf, initial = "" }: { o
                 <SearchX className="size-5 text-muted-foreground" strokeWidth={1.5} />
               </span>
               <p className="text-sm font-medium">No chat contains “{searched}”</p>
-              <p className="max-w-sm text-xs text-muted-foreground">Try a different word, a shorter phrase, or check the spelling.</p>
+              <p className="max-w-sm text-xs text-muted-foreground">Try a different word, a shorter phrase, or check the spelling. Chats that were added a moment ago may still be getting ready for search.</p>
             </div>
           )}
         </div>

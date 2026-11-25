@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { ProviderLogo } from "@/claude-logo";
 import { ContextArea, type Entry } from "@/context-area";
 import { fmtDate, prettyProject, prettyTitle, type Chat } from "@/chat-actions";
+import { Highlight } from "@/highlight";
 
 /**
  * One chat as a card: tool logo, title, project and (on hover) how long ago. Used by the sidebar and by "Pick up where you left off".
@@ -16,6 +17,7 @@ export function ChatCard({
   pinned,
   live,
   hit,
+  hitQuery,
   inProject,
   menu,
   entries,
@@ -29,6 +31,8 @@ export function ChatCard({
   pinned?: boolean;
   live?: boolean;
   hit?: string;
+  /** The search that found this chat: its words are highlighted in the title and the text shown. */
+  hitQuery?: string;
   /** The card sits under its project heading, so the project name is replaced by the full date and time. */
   inProject?: boolean;
   menu?: ReactNode;
@@ -57,7 +61,7 @@ export function ChatCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
-            <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{prettyTitle(title ?? chat.title)}</span>
+            <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{hitQuery ? <Highlight text={prettyTitle(title ?? chat.title)} q={hitQuery} activeMark={false} /> : prettyTitle(title ?? chat.title)}</span>
             {pinned && (onUnpin ? (
               <button
                 type="button"
@@ -85,7 +89,7 @@ export function ChatCard({
               </>
             )}
           </div>
-          {hit && <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{hit}</p>}
+          {hit && <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{hitQuery ? <Highlight text={hit} q={hitQuery} activeMark={false} /> : hit}</p>}
         </div>
       </div>
     </div>

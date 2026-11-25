@@ -22,6 +22,7 @@
       html, body { margin: 0; height: 100%; }
       #boot { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; font-family: "Geist Variable", sans-serif; font-weight: 400; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; background: #0a0a0a; color: #a1a1aa; }
       .light #boot, html:not(.dark) #boot { background: #ffffff; color: #71717a; }
+      #boot svg, #boot p { pointer-events: none; user-select: none; }
       #boot svg { width: 64px; height: 64px; border-radius: 16px; animation: bootpulse 2s cubic-bezier(.4,0,.6,1) infinite; }
       #boot p { margin: 0; font-size: 14px; line-height: 20px; font-weight: 400; }
       @keyframes bootpulse { 50% { opacity: .5; } }
@@ -30,7 +31,7 @@
 
   <body>
     <div id="root">
-      <div id="boot" aria-busy="true" aria-label="Starting ChatVault">
+      <div id="boot" aria-busy="true" aria-label="Starting ChatVault" data-tauri-drag-region>
         <svg viewBox="0 0 1024 1024" aria-hidden="true">
           <rect width="1024" height="1024" rx="230" fill="#18181b" />
           <rect x="196" y="230" width="632" height="410" rx="110" fill="#fafafa" />
@@ -42,6 +43,16 @@
         <p>Getting your chats ready…</p>
       </div>
     </div>
+    <script>
+      // The window starts hidden. It is shown only now, with the start-up screen above already in place,
+      // so ChatVault never opens as an empty window. A timer in the app shows it anyway if this never runs.
+      (function () {
+        try {
+          var t = window.__TAURI_INTERNALS__;
+          if (t) t.invoke("boot_ready");
+        } catch (e) {}
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

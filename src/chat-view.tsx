@@ -91,6 +91,8 @@ type Props = {
   onOverview?: () => void;
   /** Open the all-chats search with this word already typed. */
   onSearchAll?: (q: string) => void;
+  /** Words searched for when this chat was opened from search results; they start the in-chat search. */
+  initialSearch?: string;
   toast: (m: string) => void;
 };
 
@@ -310,10 +312,12 @@ export function ChatView(p: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Opened from search results: the in-chat search starts with those words, so every match is highlighted and the first one is shown.
   useEffect(() => {
-    setSearchOpen(false);
-    setQ("");
-  }, [chat.id, viewport]);
+    const seed = p.initialSearch?.trim() ?? "";
+    setSearchOpen(!!seed);
+    setQ(seed);
+  }, [chat.id, viewport, p.initialSearch]);
 
   const live = useRef({ start: 0, loading: false, partial: false, loadEarlier: p.onLoadEarlier });
   live.current = { start: page?.start ?? 0, loading: p.loadingEarlier, partial: !!page?.partial, loadEarlier: p.onLoadEarlier };

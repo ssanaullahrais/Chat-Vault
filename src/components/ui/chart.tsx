@@ -199,7 +199,12 @@ function ChartTooltipContent({
           .map((item, index) => {
             const key = `${nameKey ?? item.name ?? item.dataKey ?? "value"}`
             const itemConfig = getPayloadConfigFromPayload(config, item, key)
-            const indicatorColor = color ?? item.payload?.fill ?? item.color
+            const rawColor = color ?? item.payload?.fill ?? item.color
+            // A series drawn with a gradient (`url(#...)`) has no plain colour for the dot: use the colour from the chart config.
+            const indicatorColor =
+              typeof rawColor === "string" && rawColor.startsWith("url(")
+                ? (itemConfig?.color ?? `var(--color-${key})`)
+                : rawColor
 
             return (
               <div

@@ -28,6 +28,14 @@ tauri-plugin-updater = "2.14.0"
 tauri-plugin-process = "2.4.0"
 zstd = "0.14.3"
 tauri-plugin-dialog = "2.8.3"
+tauri-plugin-single-instance = "2"
+# Google Drive backup: HTTPS calls (already used by the updater), PKCE, and the Windows Credential Manager for the sign-in.
+reqwest = { version = "0.13", features = ["blocking", "json", "form", "query"] }
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+url = "2"
+keyring = { version = "3", features = ["windows-native"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

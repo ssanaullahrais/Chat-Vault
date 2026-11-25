@@ -55,6 +55,9 @@ export const deleteBlockedMessage = (tool: string) =>
   `This chat is stored inside ${tool} itself, so ChatVault can't delete it. Delete it in ${tool}, or use Archive to hide it here.`;
 export const PROVIDER_SHORT: Record<Provider, string> = { claude: "Claude", codex: "Codex", cursor: "Cursor", gemini: "Gemini", opencode: "OpenCode", cline: "Cline" };
 
+/** One result of the app-wide search (the search_chats command): the chat, a short piece of text around the match, and whether the title matched. */
+export type Found = { chat: Chat; snippet: string; inTitle: boolean };
+
 export type Chat = {
   provider: Provider;
   id: string;

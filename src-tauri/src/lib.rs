@@ -8,6 +8,8 @@ mod others;
 mod pageindex;
 mod paths;
 mod providers;
+mod search;
+mod gdrive;
 mod sources;
 mod sync;
 
@@ -616,6 +618,29 @@ async fn deep_search(provider: String, query: String) -> Result<Vec<SearchHit>, 
             return Ok(Vec::new());
         }
         Ok(index::search_bodies(&provider, &query, 300)?.into_iter().map(|(id, snippet)| SearchHit { id, snippet: snippet.replace('\n', " ") }).collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Searches every chat at once, best matches first (see search.rs for how a query is read and ranked).
+/// `renamed` is the list of names given to chats inside ChatVault, so they can be found by those names too.
+#[tauri::command]
+async fn search_chats(
+    query: String,
+    provider: Option<String>,
+    renamed: Option<std::collections::HashMap<String, String>>,
+    include_archived: Option<bool>,
+    limit: Option<usize>,
+) -> Result<Vec<search::Found>, String> {
+    if let Some(p) = provider.as_deref().filter(|p| *p != "all") {
+        provider_ok(p)?;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        if query.trim().chars().count() < 2 {
+            return Ok(Vec::new());
+        }
+        search::search(&query, provider.as_deref(), &renamed.unwrap_or_default(), include_archived.unwrap_or(true), limit.unwrap_or(200).clamp(1, 500))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1433,14 +1458,74 @@ async fn delete_previous_backup() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(backuploc::delete_previous).await.map_err(|e| e.to_string())?
 }
 
+// ---- Google Drive (see gdrive.rs). Every call runs off the main thread; errors are plain sentences, never tokens.
+
+#[tauri::command]
+async fn gdrive_status() -> Result<gdrive::Status, String> {
+    tauri::async_runtime::spawn_blocking(gdrive::status).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn gdrive_connect(app: AppHandle) -> Result<gdrive::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || gdrive::connect(&app)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn gdrive_cancel_connect() {
+    gdrive::cancel_sign_in();
+}
+
+#[tauri::command]
+async fn gdrive_disconnect(delete_backup: bool) -> Result<gdrive::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || gdrive::disconnect(delete_backup)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn gdrive_sync(app: AppHandle, restore: bool) -> Result<gdrive::Stats, String> {
+    tauri::async_runtime::spawn_blocking(move || gdrive::sync(&app, restore)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn gdrive_set_auto(on: bool) {
+    gdrive::set_auto(on);
+}
+
 #[tauri::command]
 async fn backup_status() -> Result<sync::BackupStatus, String> {
     tauri::async_runtime::spawn_blocking(sync::status).await.map_err(|e| e.to_string())
 }
 
+/// Brings the main window to the front: shown if it was closed to the tray, restored if minimized, then focused.
+fn show_main(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// Set once the window has been shown for the first time after start.
+static FIRST_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The window starts hidden and the start-up screen calls this once it has painted "Getting your chats ready…",
+/// so the first thing anyone sees is that screen, never an empty window.
+#[tauri::command]
+fn boot_ready(app: AppHandle) {
+    if !FIRST_SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        show_main(&app);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Only one ChatVault runs at a time. Starting it again (Start menu, shortcut, installer) brings the open one forward
+        // instead of adding another copy and another tray icon. This plugin has to be registered first.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            FIRST_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+            show_main(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1448,14 +1533,15 @@ pub fn run() {
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-            use tauri::{Emitter, Manager};
-            fn show(app: &tauri::AppHandle) {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.unminimize();
-                    let _ = w.set_focus();
+            use tauri::Emitter;
+            // Last-resort safety net: if the page never reports in and never finishes loading, show the window anyway.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if !FIRST_SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    show_main(&handle);
                 }
-            }
+            });
             let open = MenuItem::with_id(app, "open", "Open ChatVault", true, None::<&str>)?;
             let search = MenuItem::with_id(app, "search", "Search chats", true, Some("Ctrl+K"))?;
             let sync = MenuItem::with_id(app, "sync", "Sync & backup…", true, None::<&str>)?;
@@ -1468,20 +1554,20 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, e| match e.id.as_ref() {
-                    "open" => show(app),
+                    "open" => show_main(app),
                     "sync" => {
-                        show(app);
+                        show_main(app);
                         let _ = app.emit("tray-sync", ());
                     }
                     "rescan" => {
                         let _ = app.emit("tray-rescan", ());
                     }
                     "search" => {
-                        show(app);
+                        show_main(app);
                         let _ = app.emit("tray-search", ());
                     }
                     "settings" => {
-                        show(app);
+                        show_main(app);
                         let _ = app.emit("tray-settings", ());
                     }
                     "quit" => app.exit(0),
@@ -1489,7 +1575,7 @@ pub fn run() {
                 })
                 .on_tray_icon_event(|tray, e| {
                     if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                        show(tray.app_handle());
+                        show_main(tray.app_handle());
                     }
                 });
             if let Some(icon) = app.default_window_icon() {
@@ -1497,6 +1583,16 @@ pub fn run() {
             }
             tray.build(app)?;
             Ok(())
+        })
+        // Safety net for the start-up screen: once the page has loaded it has painted, so the window can be shown even if
+        // its call to boot_ready was lost. Showing it earlier (on a timer) could show an empty black window.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished
+                && webview.label() == "main"
+                && !FIRST_SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                show_main(tauri::Manager::app_handle(webview));
+            }
         })
         // Closing the window keeps ChatVault running in the tray, so backups and live sync carry on. Quit from the tray menu.
         .on_window_event(|window, event| {
@@ -1508,6 +1604,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            boot_ready,
             refresh_index,
             query_chats,
             provider_overview,
@@ -1541,6 +1638,7 @@ pub fn run() {
             fork_chat,
             read_chat_all,
             deep_search,
+            search_chats,
             build_search_index,
             search_index_status,
             reveal_in_folder,
@@ -1559,6 +1657,12 @@ pub fn run() {
             sync_chats,
             restore_chats,
             backup_status,
+            gdrive_status,
+            gdrive_connect,
+            gdrive_cancel_connect,
+            gdrive_disconnect,
+            gdrive_sync,
+            gdrive_set_auto,
             chat_sources,
             open_chat_source,
             backup_location_info,

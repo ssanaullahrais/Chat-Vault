@@ -15,6 +15,7 @@ import { fmtDate, fmtSize } from "@/chat-actions";
 import { startBulkExport, useBulkExport } from "@/bulk-export";
 import { PanelHeader, RAIL_TAB, RailLabel } from "@/rail";
 import { AUTO_SYNC_KEY } from "@/store";
+import { DriveLogo, GoogleDrivePanel } from "@/gdrive-panel";
 
 type Status = { path: string; exists: boolean; files: number; bytes: number; lastSyncMs: number | null };
 type Stats = { copied: number; skipped: number; failed: number; bytes: number; total: number };
@@ -56,6 +57,8 @@ export function SyncDialog({
   const [where, setWhere] = useState<Where | null>(null);
   const [removing, setRemoving] = useState(false);
   const [tab, setTab] = useState<string>("backup");
+  // A Google Drive sign-in or sync in progress keeps the dialog open, like a local backup does.
+  const [driveBusy, setDriveBusy] = useState(false);
 
   const load = useCallback(() => {
     invoke<Status>("backup_status").then(setStatus).catch(() => {});
@@ -133,7 +136,7 @@ export function SyncDialog({
   const icon = "size-4 text-muted-foreground";
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)}>
+    <Dialog open={open} onOpenChange={(o) => !busy && !driveBusy && onOpenChange(o)}>
       <DialogContent className="flex max-h-[min(88dvh,40rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
         <DialogHeader className="border-b px-5 py-3.5">
           <div className="flex items-center gap-3">
@@ -161,6 +164,9 @@ export function SyncDialog({
                 <RefreshCw className="size-4 shrink-0" strokeWidth={1.5} />
                 <span className="min-w-0 flex-1 truncate text-left">Automatic</span>
                 <span className="shrink-0 text-[10px] text-muted-foreground">{auto ? "On" : "Off"}</span>
+              </TabsTrigger>
+              <TabsTrigger value="drive" className={RAIL_TAB}>
+                <DriveLogo className="size-4 shrink-0" /> Google Drive
               </TabsTrigger>
               <RailLabel>Files</RailLabel>
               <TabsTrigger value="export" className={RAIL_TAB}>
@@ -244,9 +250,9 @@ export function SyncDialog({
                   <PanelHeader icon={<RotateCcw className={icon} strokeWidth={1.5} />} title="Restore" hint="Bring back chats that are gone from their tool." />
                   <div className="rounded-xl border p-3.5">
                     <div className="flex items-center justify-between gap-6">
-                      <div className="min-w-0 max-w-[19rem]">
+                      <div className="min-w-0">
                         <p className="text-sm font-medium">Restore missing chats</p>
-                        <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">Copies back only chats that are gone. A chat that still exists is never overwritten.</p>
+                        <p className="text-xs text-muted-foreground">Existing chats are never overwritten.</p>
                       </div>
                       <Button disabled={!!busy} className="shrink-0" onClick={() => run("restore")}>
                         {busy === "restore" ? <Loader2 className="size-4 animate-spin" /> : <RotateCcw className="size-4" />} Restore missing
@@ -272,6 +278,10 @@ export function SyncDialog({
                       }}
                     />
                   </div>
+                </TabsContent>
+
+                <TabsContent value="drive">
+                  <GoogleDrivePanel onChanged={onChanged} toast={toast} onBusy={setDriveBusy} />
                 </TabsContent>
 
                 <TabsContent value="export">

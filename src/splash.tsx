@@ -8,9 +8,11 @@ export function Splash({ leaving }: { leaving: boolean }) {
       className={cn("fixed inset-0 z-[70] flex flex-col items-center justify-center gap-4 bg-background transition-opacity duration-300", leaving ? "pointer-events-none opacity-0" : "opacity-100")}
       aria-busy="true"
       aria-label="Starting ChatVault"
+      // The window has no title bar while this shows, so the whole screen moves it, logo and text included.
+      data-tauri-drag-region
     >
-      <AppLogo className="size-16 animate-pulse rounded-2xl" />
-      <p className="text-sm text-muted-foreground">Getting your chats ready…</p>
+      <AppLogo className="pointer-events-none size-16 animate-pulse rounded-2xl" />
+      <p className="pointer-events-none select-none text-sm text-muted-foreground">Getting your chats ready…</p>
     </div>
   );
 }

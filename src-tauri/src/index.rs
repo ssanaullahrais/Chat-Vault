@@ -15,7 +15,11 @@ use crate::relevant;
 use tauri::{AppHandle, Emitter};
 
 static BODIES_BUSY: AtomicBool = AtomicBool::new(false);
-static REFRESHING: AtomicBool = AtomicBool::new(false);
+/// A change arrived while the search index was being updated: run once more when it finishes, so it is not lost.
+static BODIES_AGAIN: AtomicBool = AtomicBool::new(false);
+/// One refresh at a time. A refresh asked for while another runs waits for it and then runs too, so a change that
+/// landed during the first one is still picked up (it used to be skipped, which left new chats and renames missing).
+static REFRESH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +95,19 @@ pub fn open_db() -> Result<Connection, String> {
          CREATE VIRTUAL TABLE IF NOT EXISTS chats_fts USING fts5(key UNINDEXED, title, project, preview);",
     )
     .map_err(|e| e.to_string())?;
+    // The name a chat was given inside its own tool (Claude Code's /rename), kept apart so the desktop app's
+    // record does not overwrite a newer name.
+    static ADD_CUSTOM_TITLE: std::sync::Once = std::sync::Once::new();
+    ADD_CUSTOM_TITLE.call_once(|| {
+        let has: bool = c
+            .prepare("SELECT 1 FROM pragma_table_info('chats') WHERE name='custom_title'")
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(true);
+        if !has && c.execute("ALTER TABLE chats ADD COLUMN custom_title TEXT", []).is_ok() {
+            // Read every Claude transcript once more so chats renamed before this version get their name.
+            let _ = c.execute("UPDATE chats SET mtime=-1 WHERE provider='claude'", []);
+        }
+    });
     Ok(c)
 }
 
@@ -195,11 +212,13 @@ fn load_claude_meta() -> HashMap<String, ClaudeMeta> {
     out
 }
 
+/// Codex thread names. The file is appended to whenever a thread is renamed, so the last line for an id is its current
+/// name. The backup copy is read first and the live file last, so the live name wins.
 fn load_codex_index() -> HashMap<String, (String, Option<i64>)> {
     let mut out = HashMap::new();
     let files = [
-        codex_home().map(|c| c.join("session_index.jsonl")),
         backup_root().map(|b| b.join("codex").join("session_index.jsonl")),
+        codex_home().map(|c| c.join("session_index.jsonl")),
     ];
     for f in files.into_iter().flatten() {
         let Ok(file) = File::open(f) else { continue };
@@ -216,10 +235,28 @@ fn load_codex_index() -> HashMap<String, (String, Option<i64>)> {
                 .and_then(|x| x.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.timestamp_millis());
-            out.entry(id.to_string()).or_insert((name.to_string(), ms));
+            out.insert(id.to_string(), (name.to_string(), ms));
         }
     }
     out
+}
+
+/// The newest name given to a Claude Code chat with /rename (or by the desktop app), read from the transcript itself.
+fn last_custom_title(path: &Path) -> Option<String> {
+    let mut found = None;
+    for line in open_lines(path)? {
+        if !line.contains("\"custom-title\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if v.get("type").and_then(|x| x.as_str()) == Some("custom-title") {
+                if let Some(t) = v.get("customTitle").and_then(|x| x.as_str()).map(str::trim).filter(|t| !t.is_empty()) {
+                    found = Some(t.to_string());
+                }
+            }
+        }
+    }
+    found
 }
 
 fn parse_iso(s: &str) -> Option<i64> {
@@ -253,6 +290,8 @@ struct Row {
     s: ChatSummary,
     mtime: i64,
     preview: String,
+    /// The name the chat was given in its own tool, when it has one.
+    custom_title: Option<String>,
 }
 
 fn first_user_text(provider: &str, path: &Path, max_lines: usize) -> Option<String> {
@@ -295,8 +334,11 @@ fn build_row(
     if f.provider == "claude" {
         let dir_name = f.path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let preview = first_user_text("claude", &f.path, 400);
+        let custom = last_custom_title(&f.path);
+        // A live chat counts as active when its file last changed, even if the desktop app's record is older.
+        let last_of = |recorded: Option<i64>| if f.backup { recorded.unwrap_or(mtime) } else { recorded.unwrap_or(0).max(mtime) };
         if let Some(m) = cmeta.get(&stem) {
-            let title = m.title.clone().unwrap_or_else(|| "Untitled".into());
+            let title = custom.clone().or_else(|| m.title.clone()).unwrap_or_else(|| "Untitled".into());
             return Some(Row {
                 s: ChatSummary {
                     provider: "claude".into(),
@@ -307,7 +349,7 @@ fn build_row(
                     project: project_of(&m.cwd, &dir_name),
                     cwd: m.cwd.clone(),
                     created_ms: m.created,
-                    last_ms: m.last.unwrap_or(mtime),
+                    last_ms: last_of(m.last),
                     archived: m.archived,
                     size,
                     path,
@@ -318,9 +360,13 @@ fn build_row(
                 },
                 mtime,
                 preview: preview.unwrap_or_default(),
+                custom_title: custom,
             });
         }
-        let title = clip(preview.as_deref()?.trim(), 80);
+        let title = match &custom {
+            Some(t) => t.clone(),
+            None => clip(preview.as_deref()?.trim(), 80),
+        };
         let cwd = transcript_cwd(&f.path);
         return Some(Row {
             s: ChatSummary {
@@ -343,6 +389,7 @@ fn build_row(
             },
             mtime,
             preview: preview.unwrap_or_default(),
+            custom_title: custom,
         });
     }
 
@@ -377,7 +424,7 @@ fn build_row(
             project: project_of(&cwd, "unknown"),
             cwd,
             created_ms: p.get("timestamp").and_then(|x| x.as_str()).and_then(parse_iso),
-            last_ms: updated.flatten().unwrap_or(mtime),
+            last_ms: if f.backup { updated.flatten().unwrap_or(mtime) } else { updated.flatten().unwrap_or(0).max(mtime) },
             archived,
             size,
             path,
@@ -388,6 +435,7 @@ fn build_row(
         },
         mtime,
         preview: preview.unwrap_or_default(),
+        custom_title: None,
     })
 }
 
@@ -407,11 +455,11 @@ fn upsert(c: &Connection, r: &Row, replace: bool) -> rusqlite::Result<()> {
     c.execute("DELETE FROM chats WHERE path=?1 AND NOT (provider=?2 AND id=?3)", params![s.path, s.provider, s.id])?;
     c.execute("DELETE FROM chats_fts WHERE key=?1", params![key])?;
     c.execute(
-        "INSERT OR REPLACE INTO chats(provider,id,local_id,title,account,project,cwd,created_ms,last_ms,archived,size,mtime,path,model,has_meta,backup)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        "INSERT OR REPLACE INTO chats(provider,id,local_id,title,account,project,cwd,created_ms,last_ms,archived,size,mtime,path,model,has_meta,backup,custom_title)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
         params![
             s.provider, s.id, s.local_id, s.title, s.account, s.project, s.cwd, s.created_ms, s.last_ms,
-            s.archived as i64, s.size, r.mtime, s.path, s.model, s.has_metadata as i64, s.backup as i64
+            s.archived as i64, s.size, r.mtime, s.path, s.model, s.has_metadata as i64, s.backup as i64, r.custom_title
         ],
     )?;
     c.execute(
@@ -426,14 +474,34 @@ fn upsert(c: &Connection, r: &Row, replace: bool) -> rusqlite::Result<()> {
 pub fn files_fingerprint() -> (usize, i64) {
     let files = collect_files();
     let newest = files.iter().map(|f| mtime_ms(&f.path).1).max().unwrap_or(0);
-    // Gemini CLI, OpenCode and Cline writes count as changes too.
-    (files.len(), newest.max(crate::others::fingerprint()).max(crate::codex_db::fingerprint()))
+    // Gemini CLI, OpenCode and Cline writes count as changes too, and so do renames: the Claude desktop app's chat
+    // records and Codex's thread-name file change without the chat file itself changing.
+    (files.len(), newest.max(crate::others::fingerprint()).max(crate::codex_db::fingerprint()).max(names_fingerprint()))
+}
+
+/// When a chat name was last changed outside ChatVault (Claude desktop app records, Codex thread names).
+fn names_fingerprint() -> i64 {
+    let mut newest = codex_home().map(|c| mtime_ms(&c.join("session_index.jsonl")).1).unwrap_or(0);
+    if let Some(root) = claude_meta() {
+        for acct in subdirs(&root) {
+            for org in subdirs(&acct) {
+                newest = newest.max(mtime_ms(&org).1);
+                let Ok(rd) = fs::read_dir(&org) else { continue };
+                for e in rd.flatten() {
+                    if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                            newest = newest.max(d.as_millis() as i64);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    newest
 }
 
 pub fn refresh(app: Option<&AppHandle>) -> Result<(), String> {
-    if REFRESHING.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
+    let _guard = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let result = (|| {
         let mut c = open_db()?;
         let source_upgrade = c.query_row("SELECT value FROM source_state WHERE name='local_sources'",[],|r|r.get::<_,String>(0)).ok().as_deref()!=Some("4");
@@ -544,18 +612,41 @@ pub fn refresh(app: Option<&AppHandle>) -> Result<(), String> {
             if !source_upgrade && known.get(&ch.path)==Some(&(0,ch.updated)) {continue;}
             let row = Row { s: ChatSummary { provider:"codex".into(),id:ch.id,local_id:None,title:ch.title.clone(),account:ch.account,
                 project:project_of(&ch.cwd,"Codex"),cwd:ch.cwd,created_ms:Some(ch.created),last_ms:ch.updated,archived:ch.archived,
-                size:0,path:ch.path,model:ch.model,has_metadata:true,backup:false,user_archived:false }, mtime:ch.updated,preview:ch.title };
+                size:0,path:ch.path,model:ch.model,has_metadata:true,backup:false,user_archived:false }, mtime:ch.updated,preview:ch.title,custom_title:None };
             let _ = upsert(&tx,&row,true);
         }
         tx.commit().map_err(|e|e.to_string())?;
 
-        // Claude titles live in metadata files that change without the transcript changing.
+        // Claude titles live in metadata files that change without the transcript changing. A name set inside the chat
+        // itself (/rename) still wins, and a live chat stays as recent as its file.
         let tx = c.transaction().map_err(|e| e.to_string())?;
         for (id, m) in &cmeta {
+            let before: Option<String> = tx.query_row("SELECT title FROM chats WHERE provider='claude' AND id=?1", params![id], |r| r.get(0)).optional().ok().flatten();
+            let Some(before) = before else { continue };
             let _ = tx.execute(
-                "UPDATE chats SET title=COALESCE(?1,title), account=?2, last_ms=COALESCE(?3,last_ms), archived=?4, local_id=COALESCE(?5,local_id), has_meta=1 WHERE provider='claude' AND id=?6",
+                "UPDATE chats SET title=COALESCE(custom_title,?1,title), account=?2,
+                   last_ms=MAX(COALESCE(?3,last_ms), CASE WHEN backup=0 THEN mtime ELSE 0 END),
+                   archived=?4, local_id=COALESCE(?5,local_id), has_meta=1
+                 WHERE provider='claude' AND id=?6",
                 params![m.title, m.account, m.last, m.archived as i64, m.local_id, id],
             );
+            let after: Option<String> = tx.query_row("SELECT title FROM chats WHERE provider='claude' AND id=?1", params![id], |r| r.get(0)).optional().ok().flatten();
+            // The searchable copy of the title follows a rename too.
+            if let Some(after) = after.filter(|a| *a != before) {
+                let _ = tx.execute("UPDATE chats_fts SET title=?1 WHERE key='claude:'||?2", params![after, id]);
+            }
+        }
+        // Codex names change in session_index.jsonl without the chat file changing (renaming a thread in Codex).
+        for (id, (name, _)) in &cindex {
+            let changed = tx
+                .execute(
+                    "UPDATE chats SET title=?1 WHERE provider='codex' AND id=?2 AND path NOT LIKE 'codex-db:%' AND title<>?1",
+                    params![name, id],
+                )
+                .unwrap_or(0);
+            if changed > 0 {
+                let _ = tx.execute("UPDATE chats_fts SET title=?1 WHERE key='codex:'||?2", params![name, id]);
+            }
         }
         tx.commit().map_err(|e| e.to_string())?;
                 // Cursor chats are rebuilt only when Cursor's files changed.
@@ -590,6 +681,7 @@ pub fn refresh(app: Option<&AppHandle>) -> Result<(), String> {
                         },
                         mtime: ofp,
                         preview: ch.title,
+                        custom_title: None,
                     };
                     let _ = upsert(&tx, &row, true);
                 }
@@ -627,6 +719,7 @@ pub fn refresh(app: Option<&AppHandle>) -> Result<(), String> {
                     },
                     mtime: fp,
                     preview: ch.title,
+                    custom_title: None,
                 };
                 let _ = upsert(&tx, &row, true);
             }
@@ -636,24 +729,15 @@ pub fn refresh(app: Option<&AppHandle>) -> Result<(), String> {
         c.execute("INSERT OR REPLACE INTO source_state(name,value) VALUES('local_sources','4')",[]).map_err(|e|e.to_string())?;
         Ok(())
     })();
-    REFRESHING.store(false, Ordering::SeqCst);
     result
 }
 
+/// The full-text expression for what was typed (words, "phrases", -left-out words, OR); see search.rs.
 fn fts_expr(q: &str) -> Option<String> {
-    let toks: Vec<String> = q
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"*", t))
-        .collect();
-    if toks.is_empty() {
-        None
-    } else {
-        Some(toks.join(" "))
-    }
+    crate::search::fts_expr(&crate::search::parse(q))
 }
 
-fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<ChatSummary> {
+pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<ChatSummary> {
     Ok(ChatSummary {
         provider: r.get(0)?,
         id: r.get(1)?,
@@ -674,7 +758,7 @@ fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<ChatSummary> {
     })
 }
 
-const COLS: &str = "provider,id,local_id,title,account,project,cwd,created_ms,last_ms,archived,size,path,model,has_meta,backup,EXISTS(SELECT 1 FROM user_archive u WHERE u.provider=chats.provider AND u.id=chats.id)";
+pub(crate) const COLS: &str = "provider,id,local_id,title,account,project,cwd,created_ms,last_ms,archived,size,path,model,has_meta,backup,EXISTS(SELECT 1 FROM user_archive u WHERE u.provider=chats.provider AND u.id=chats.id)";
 
 pub fn query(provider: &str, account: Option<String>, q: &str, offset: i64, limit: i64, sort: &str, scope: &str) -> Result<Page, String> {
     let c = open_db()?;
@@ -810,10 +894,31 @@ pub fn all_tags(provider: &str) -> Result<Vec<(String, i64)>, String> {
 /// It runs after a scan, a little at a time, and only touches chats that are new or changed.
 pub fn index_bodies(app: Option<&AppHandle>) -> Result<(), String> {
     if BODIES_BUSY.swap(true, Ordering::SeqCst) {
+        BODIES_AGAIN.store(true, Ordering::SeqCst);
         return Ok(());
     }
+    let mut result = index_bodies_once(app);
+    // Chats that changed while this ran are indexed now instead of waiting for the next change.
+    while result.is_ok() && BODIES_AGAIN.swap(false, Ordering::SeqCst) {
+        result = index_bodies_once(app);
+    }
+    BODIES_BUSY.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Text kept per chat in the search index. Long chats used to be cut at 400 KB, so anything said later in a long chat
+/// (usually the newest part) could not be found.
+const BODY_LIMIT: usize = 12_000_000;
+
+fn index_bodies_once(app: Option<&AppHandle>) -> Result<(), String> {
     let result = (|| {
         let c = open_db()?;
+        // Version 2 indexes whole chats: chats indexed by an older version are read again once, in the background.
+        let version: Option<String> = c.query_row("SELECT value FROM source_state WHERE name='bodies_version'", [], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        if version.as_deref() != Some("2") {
+            c.execute("DELETE FROM body_state", []).map_err(|e| e.to_string())?;
+            c.execute("INSERT OR REPLACE INTO source_state(name,value) VALUES('bodies_version','2')", []).map_err(|e| e.to_string())?;
+        }
         let todo: Vec<(String, String, String, i64, i64)> = {
             let mut st = c
                 .prepare(
@@ -848,11 +953,16 @@ pub fn index_bodies(app: Option<&AppHandle>) -> Result<(), String> {
                     }
                 }
             }
-            for m in msgs.iter().filter(|m| matches!(m.kind.as_str(), "text" | "summary")) {
-                if body.len() > 400_000 {
+            for m in msgs.iter().filter(|m| matches!(m.kind.as_str(), "text" | "summary" | "tool")) {
+                if body.len() > BODY_LIMIT {
                     break;
                 }
-                body.push_str(m.text.trim());
+                // Tool steps add the command, file or search they ran (kept short), so those can be found too.
+                if m.kind == "tool" {
+                    body.push_str(&clip(m.text.trim(), 300));
+                } else {
+                    body.push_str(m.text.trim());
+                }
                 body.push('\n');
             }
             let _ = tx.execute("DELETE FROM chat_bodies WHERE key=?1", params![key]);
@@ -877,7 +987,6 @@ pub fn index_bodies(app: Option<&AppHandle>) -> Result<(), String> {
         }
         Ok(())
     })();
-    BODIES_BUSY.store(false, Ordering::SeqCst);
     result
 }
 
