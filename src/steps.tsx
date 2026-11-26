@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useState, type ReactNode } from "react";
 import { useStickyOpen } from "@/sticky-open";
 import { Bot, Brain, FilePen, CircleCheck, CircleDashed, Circle, Globe, ListTodo, Terminal as TerminalIcon, Wrench, ArrowUpRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -9,7 +9,8 @@ import { Highlight, textHas } from "@/highlight";
 import { ColoredOutput, ShellLine, guessLanguage } from "@/shell-highlight";
 import { hostname, uniqueUrls } from "@/ai-elements";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { Msg } from "@/chat-actions";
+import { PROVIDER_NAME, type Msg, type Provider } from "@/chat-actions";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cardOf, editInfo, failed, family, fileName, prettyTool, shellCommand, stepDescription, type PlanStep } from "@/step-summary";
 
 export type Item = Msg & { result?: Msg };
@@ -72,11 +73,23 @@ export function PlanBlock({ steps, memoKey }: { steps: PlanStep[]; memoKey?: str
   );
 }
 
+function SavedChoice({ provider, className, children }: { provider: Provider; className: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Tooltip open={open} onOpenChange={setOpen}>
+      <TooltipTrigger render={<button type="button" className={`text-left ${className}`} onClick={() => setOpen(true)} />}>
+        {children}
+      </TooltipTrigger>
+      <TooltipContent>Open the original chat in {PROVIDER_NAME[provider]} to respond.</TooltipContent>
+    </Tooltip>
+  );
+}
+
 /**
  * A card the AI app drew for you: the end-of-turn "next step" box (recap, the question, its buttons) or a question
- * with options, with the answer when it is in the file. Buttons are shown as they appeared; they do nothing here.
+ * with options and any recorded answer. Choices explain where to respond.
  */
-export function CardBlock({ item }: { item: Item }) {
+export function CardBlock({ item, provider }: { item: Item; provider: Provider }) {
   const card = cardOf(item);
   if (!card) return null;
   if (card.kind === "next") {
@@ -88,9 +101,9 @@ export function CardBlock({ item }: { item: Item }) {
           {card.actions.length > 0 && (
             <div className="mt-3 flex flex-wrap gap-2">
               {card.actions.map((a, i) => (
-                <span key={a + i} className={i === 0 ? "rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground" : "rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground"}>
+                <SavedChoice provider={provider} key={a + i} className={i === 0 ? "rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground" : "rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground"}>
                   {a}
-                </span>
+                </SavedChoice>
               ))}
             </div>
           )}
@@ -110,12 +123,14 @@ export function CardBlock({ item }: { item: Item }) {
                 {q.options.map((o, oi) => {
                   const picked = !!card.answer && card.answer.includes(o.label);
                   return (
-                    <li key={oi} className={picked ? "rounded-md border border-foreground/30 bg-muted/60 px-2.5 py-1.5" : "rounded-md border px-2.5 py-1.5"}>
-                      <span className="flex items-center gap-1.5">
-                        {picked && <CircleCheck className="size-3.5 shrink-0" />}
-                        <span className={picked ? "font-medium" : undefined}>{o.label}</span>
-                      </span>
-                      {o.description && <span className="block text-xs text-muted-foreground">{o.description}</span>}
+                    <li key={oi}>
+                      <SavedChoice provider={provider} className={"block w-full " + (picked ? "rounded-md border border-foreground/30 bg-muted/60 px-2.5 py-1.5" : "rounded-md border px-2.5 py-1.5")}>
+                        <span className="flex items-center gap-1.5">
+                          {picked && <CircleCheck className="size-3.5 shrink-0" />}
+                          <span className={picked ? "font-medium" : undefined}>{o.label}</span>
+                        </span>
+                        {o.description && <span className="block text-xs text-muted-foreground">{o.description}</span>}
+                      </SavedChoice>
                     </li>
                   );
                 })}
@@ -309,6 +324,36 @@ export const StepItem = memo(function StepItem({ item, q, memoKey }: { item: Ite
           )}
           {failedTag}
         </TraceLine>
+      </Trace>
+    );
+  }
+
+  const resultText = item.result?.text.trim();
+  if (resultText) {
+    return (
+      <Trace>
+        <TraceCollapsible open={open} onOpenChange={setOpen}>
+          <TraceCollapsibleTrigger>
+            <TraceLine status={bad ? "error" : undefined}>
+              <TraceIcon><Wrench /></TraceIcon>
+              <TraceTitle className="truncate font-medium">{desc || prettyTool(item.name ?? name)}</TraceTitle>
+              {(filePath || detail) && <TraceDescription className="truncate">{filePath || detail}</TraceDescription>}
+              {failedTag}
+            </TraceLine>
+          </TraceCollapsibleTrigger>
+          <TraceCollapsibleContent>
+            {filePath && (
+              <button type="button" onClick={() => files.open(filePath)} className="mb-2 max-w-full truncate text-left text-xs underline underline-offset-2">
+                {filePath}
+              </button>
+            )}
+            <CodeBlock size="sm">
+              <CodeBlockContent data-lenis-prevent className="max-h-64">
+                <Highlight text={resultText} q={q} activeMark={false} />
+              </CodeBlockContent>
+            </CodeBlock>
+          </TraceCollapsibleContent>
+        </TraceCollapsible>
       </Trace>
     );
   }

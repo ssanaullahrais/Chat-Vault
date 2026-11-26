@@ -1,3 +1,5 @@
+import { DriveJobsStatus } from "@/drive-jobs";
+import { BACKUP_AUTO_ENABLED, backupChanges, invalidateBackups } from "@/backup-refresh";
 import { notifyError } from "@/toast";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -71,11 +73,14 @@ export function SyncDialog({
     invoke<Where>("backup_location_info").then(setWhere).catch(() => {});
   }, []);
   useEffect(() => {
-    if (open) {
-      setLast(null);
-      load();
-    }
-  }, [open, load]);
+    if (!open) return;
+    return backupChanges(() => {
+      if (tab === "backup") load();
+    });
+  }, [open, tab, load]);
+  useEffect(() => {
+    if (open && tab === "backup") load();
+  }, [open, tab, load]);
   useEffect(() => {
     const un = listen<Prog>("sync-progress", (e) => setProg(e.payload));
     return () => {
@@ -136,26 +141,26 @@ export function SyncDialog({
   };
 
   const run = async (kind: "sync" | "restore") => {
-    const ok = await confirmAction(
-      kind === "sync"
-        ? { title: "Back up now?", description: `New and changed chats are copied into ${status?.path || "the backup folder"}. Nothing in the tools is changed.`, action: "Back up now", icon: <UploadCloud className="size-4 text-muted-foreground" strokeWidth={1.5} /> }
-        : { title: "Restore missing chats?", description: "Chats in the backup that are missing from their tools are copied back. Chats that are already there are never overwritten.", action: "Restore", icon: <RotateCcw className="size-4 text-muted-foreground" strokeWidth={1.5} /> },
+    const ok = kind === "sync" || await confirmAction(
+      { title: "Restore missing chats?", description: "Chats in the backup that are missing from their tools are copied back. Chats that are already there are never overwritten.", action: "Restore", icon: <RotateCcw className="size-4 text-muted-foreground" strokeWidth={1.5} /> },
     );
     if (!ok) return;
     setBusy(kind);
+    setLast(null);
     setProg(null);
     try {
       const s = await invoke<Stats>(kind === "sync" ? "sync_chats" : "restore_chats");
-      setLast(
-        `${kind === "sync" ? "Copied" : "Restored"} ${s.copied} files (${fmtSize(s.bytes)}). ${s.skipped} were already up to date.${s.failed ? ` ${s.failed} could not be copied.` : ""}`,
-      );
-      toast(kind === "sync" ? "Chats synced to the backup folder" : "Missing chats restored");
-      load();
-      onChanged();
+      const message = s.copied || s.failed
+        ? `${kind === "sync" ? "Copied" : "Restored"} ${s.copied} ${s.copied === 1 ? "file" : "files"} (${fmtSize(s.bytes)}).${s.failed ? ` ${s.failed} files could not be copied.` : ""}`
+        : kind === "sync" ? "The backup folder is up to date." : "No missing files to restore from this PC.";
+      setLast(message);
+      toast(message);
+      if (s.copied > 0) onChanged();
     } catch (e) {
       notifyError(e);
     } finally {
       setBusy(null);
+      invalidateBackups();
     }
   };
 
@@ -174,10 +179,13 @@ export function SyncDialog({
               <DialogTitle className="text-base font-medium">Sync &amp; backup</DialogTitle>
               <DialogDescription>Keep a copy of your chats outside the tools.</DialogDescription>
             </div>
+            <div className="ml-auto mr-6">
+              <DriveJobsStatus onSettings={() => { if (!busy && !driveBusy) setTab("drive"); }} />
+            </div>
           </div>
         </DialogHeader>
 
-        <Tabs orientation="vertical" value={tab} onValueChange={(v) => setTab(String(v))} className="min-h-0 flex-1 flex-col gap-0 sm:flex-row">
+        <Tabs orientation="vertical" value={tab} onValueChange={(v) => { if (!busy && !driveBusy) setTab(String(v)); }} className="min-h-0 flex-1 flex-col gap-0 sm:flex-row">
           <ScrollArea className="shrink-0 border-b sm:w-52 sm:border-b-0 sm:border-r" viewportClassName="max-h-[min(70dvh,32rem)]">
             <TabsList variant="line" className="h-auto w-full flex-col items-stretch gap-0.5 p-2" aria-label="Sync and backup sections">
               {/* Your backups first; then where and when they are made, the copy in Google Drive, and getting chats back. */}
@@ -214,7 +222,7 @@ export function SyncDialog({
                     hint="Where copies of your chats are kept."
                     action={
                       <Button size="sm" disabled={!!busy} className="shrink-0" onClick={() => run("sync")}>
-                        {busy === "sync" ? <Loader2 className="size-4 animate-spin" /> : <UploadCloud className="size-4" />} Sync now
+                        {busy === "sync" ? <Loader2 className="size-4 animate-spin" /> : <UploadCloud className="size-4" />} Back up now
                       </Button>
                     }
                   />
@@ -290,7 +298,7 @@ export function SyncDialog({
                     <div className="flex items-center justify-between gap-6">
                       <div className="min-w-0">
                         <p className="text-sm font-medium">Restore missing chats</p>
-                        <p className="text-xs text-muted-foreground">Existing chats are never overwritten.</p>
+                        <p className="text-xs text-muted-foreground">From the backup folder on this PC. Existing tool files are kept.</p>
                       </div>
                       <Button disabled={!!busy} className="shrink-0" onClick={() => run("restore")}>
                         {busy === "restore" ? <Loader2 className="size-4 animate-spin" /> : <RotateCcw className="size-4" />} Restore missing
@@ -313,6 +321,7 @@ export function SyncDialog({
                       onCheckedChange={(v) => {
                         setAuto(v);
                         localStorage.setItem(AUTO_SYNC_KEY, v ? "1" : "0");
+                        if (v) window.dispatchEvent(new Event(BACKUP_AUTO_ENABLED));
                       }}
                     />
                   </div>

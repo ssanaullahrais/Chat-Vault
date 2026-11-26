@@ -138,16 +138,19 @@ function CodeBlockCopyButton({
 function CodeBlockContent({
   className,
   children,
+  scrollViewportClassName,
   style,
   wrap = false,
   lineNumbers = false,
   startLine = 1,
   ...props
 }: React.ComponentProps<"pre"> & {
+  scrollViewportClassName?: string
   wrap?: boolean
   lineNumbers?: boolean
   startLine?: number
 }) {
+  const useScrollArea = !wrap || scrollViewportClassName !== undefined
   const pre = (
     <pre
       data-slot="code-block-content"
@@ -159,7 +162,7 @@ function CodeBlockContent({
       className={cn(
         "min-h-0 w-max min-w-full px-3 py-3 text-start font-mono leading-relaxed outline-none group-has-data-[slot=code-block-footer]/code-block:pb-2 group-has-data-[slot=code-block-header]/code-block:pt-2 group-data-[size=sm]/code-block:px-2.5 group-data-[size=sm]/code-block:py-2.5 group-data-[size=sm]/code-block:group-has-data-[slot=code-block-header]/code-block:pt-1.5 data-wrap:w-full data-wrap:wrap-break-word data-wrap:whitespace-pre-wrap",
         className,
-        wrap && "overflow-auto"
+        !useScrollArea && "overflow-auto"
       )}
       {...props}
     >
@@ -178,10 +181,9 @@ function CodeBlockContent({
       </code>
     </pre>
   )
-  // Long lines scroll sideways inside the shadcn scroll area; wrapped code needs no scrollbar.
-  if (wrap) return pre
+  if (!useScrollArea) return pre
   return (
-    <ScrollArea horizontal className="min-w-0 w-full [&>[data-slot=scroll-area-viewport]>div]:!block">
+    <ScrollArea horizontal viewportClassName={scrollViewportClassName} className="min-w-0 w-full [&>[data-slot=scroll-area-viewport]>div]:!block">
       {pre}
     </ScrollArea>
   )

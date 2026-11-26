@@ -103,39 +103,92 @@ function imageSize(src: string): { w: number; h: number } | null {
   return found;
 }
 
+/** Browser screenshots can contain a large white canvas to the right of a narrow captured page. */
+function screenshotBounds(image: HTMLImageElement) {
+  const { naturalWidth, naturalHeight } = image;
+  if (!naturalWidth || !naturalHeight) return null;
+  const scale = Math.min(1, 320 / Math.max(naturalWidth, naturalHeight));
+  const canvas = document.createElement("canvas");
+  const width = canvas.width = Math.max(1, Math.round(naturalWidth * scale));
+  const height = canvas.height = Math.max(1, Math.round(naturalHeight * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(image, 0, 0, width, height);
+  const { data } = ctx.getImageData(0, 0, width, height);
+  let right = 0;
+  let bottom = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = width - 1; x >= 0; x--) {
+      const i = (y * width + x) * 4;
+      if (data[i] === 255 && data[i + 1] === 255 && data[i + 2] === 255 && data[i + 3] === 255) continue;
+      right = Math.max(right, x + 1);
+      bottom = y + 1;
+      break;
+    }
+    if (right > width * 2 / 3) return null;
+  }
+  if (!right) return null;
+  return {
+    w: Math.min(naturalWidth, Math.ceil((right + 2) * naturalWidth / width)),
+    h: Math.min(naturalHeight, Math.ceil((bottom + 2) * naturalHeight / height)),
+    originalWidth: naturalWidth,
+  };
+}
+
 /** A picture in the conversation, with actions that appear on hover. */
-export function ChatImage({ src }: { src: string }) {
+export function ChatImage({ src, thumbnail = false, trimScreenshotMargin = false }: { src: string; thumbnail?: boolean; trimScreenshotMargin?: boolean }) {
   const g = useContext(GalleryContext);
   const [copied, copy] = useCopied();
   const n = Math.max(1, g.images.indexOf(src) + 1);
-  const size = imageSize(src);
+  const size = thumbnail ? null : imageSize(src);
+  const [preview, setPreview] = useState<{ src: string; bounds: ReturnType<typeof screenshotBounds> } | null>(null);
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const crop = trimScreenshotMargin && !thumbnail && preview?.src === src ? preview.bounds : null;
+  if (failedSrc === src) {
+    return <p className={cn("rounded-lg border bg-muted/30 text-xs text-muted-foreground", thumbnail ? "grid size-20 place-items-center p-1 text-center" : "px-3 py-2")}>Image preview unavailable</p>;
+  }
   return (
-    <div className="group/img relative inline-block max-w-full overflow-hidden rounded-xl border bg-muted/30 shadow-sm">
-      <button type="button" onClick={() => g.open(src)} className="block cursor-zoom-in" aria-label="Open image">
+    <div className={cn(
+      "group/img relative inline-block max-w-full overflow-hidden border border-border/80 bg-muted/30 shadow-xs transition-[border-color,box-shadow] hover:border-foreground/20 hover:shadow-sm focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/35",
+      thumbnail ? "size-20 shrink-0 rounded-lg" : "rounded-xl",
+    )}>
+      <button
+        type="button"
+        onClick={() => g.open(src)}
+        className={cn("block cursor-zoom-in focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring", thumbnail && "size-full", crop && "relative max-w-full overflow-hidden")}
+        style={crop ? { width: crop.w * Math.min(1, 320 / crop.h), aspectRatio: `${crop.w} / ${crop.h}` } : undefined}
+        aria-label={thumbnail ? `Open image ${n}` : "Open image"}
+      >
         <img
           src={src}
           alt="Chat attachment"
           decoding="async"
-          // Its space is kept from the first frame, so a picture appearing never pushes the messages below it.
+          onError={() => setFailedSrc(src)}
+          onLoad={trimScreenshotMargin && !thumbnail && /^data:image\/(?:png|jpeg|webp);base64,/i.test(src)
+            ? (event) => setPreview({ src, bounds: screenshotBounds(event.currentTarget) })
+            : undefined}
+          // Reserve space from the header while the picture decodes.
           width={size ? Math.round(size.w * Math.min(1, 320 / size.h)) : undefined}
           height={size ? Math.round(size.h * Math.min(1, 320 / size.h)) : undefined}
-          style={size ? { aspectRatio: `${size.w} / ${size.h}` } : undefined}
-          className="block h-auto max-h-80 max-w-full object-contain"
+          style={crop ? { width: `${100 * crop.originalWidth / crop.w}%` } : size ? { aspectRatio: `${size.w} / ${size.h}` } : undefined}
+          className={cn("block", crop ? "absolute top-0 left-0 h-auto max-w-none" : thumbnail ? "size-full object-cover" : "h-auto max-h-80 max-w-full object-contain")}
         />
       </button>
-      <div className="absolute right-2 top-2 flex gap-1 rounded-lg bg-black/60 p-1 opacity-0 backdrop-blur transition-opacity focus-within:opacity-100 group-hover/img:opacity-100">
-        <IconBtn label="Open full screen" onClick={() => g.open(src)}>
-          <Maximize2 className="size-4" />
-        </IconBtn>
-        <IconBtn label={copied ? "Copied" : "Copy image"} onClick={() => copy(src)}>
-          {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
-        </IconBtn>
-        <IconBtn label="Download" onClick={() => downloadImage(src, n)}>
-          <Download className="size-4" />
-        </IconBtn>
-      </div>
-      {g.images.length > 1 && (
-        <span className="absolute bottom-2 left-2 rounded-md bg-black/60 px-1.5 py-0.5 text-[11px] tabular-nums text-white/90 backdrop-blur">
+      {!thumbnail && (
+        <div className="pointer-events-none absolute top-1.5 right-1.5 flex max-w-[calc(100%-0.75rem)] flex-wrap justify-end gap-0.5 rounded-lg bg-black/70 p-0.5 opacity-0 backdrop-blur-sm transition-opacity group-focus-within/img:pointer-events-auto group-focus-within/img:opacity-100 group-hover/img:pointer-events-auto group-hover/img:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 motion-reduce:transition-none">
+          <IconBtn label="Open full screen" className="size-6 rounded-md" onClick={() => g.open(src)}>
+            <Maximize2 className="size-3.5" />
+          </IconBtn>
+          <IconBtn label={copied ? "Copied" : "Copy image"} className="size-6 rounded-md" onClick={() => copy(src)}>
+            {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+          </IconBtn>
+          <IconBtn label="Download" className="size-6 rounded-md" onClick={() => downloadImage(src, n)}>
+            <Download className="size-3.5" />
+          </IconBtn>
+        </div>
+      )}
+      {!thumbnail && g.images.length > 1 && (
+        <span className="pointer-events-none absolute bottom-1.5 left-1.5 rounded-full bg-black/70 px-2 py-0.5 text-[11px] leading-4 font-medium tabular-nums text-white backdrop-blur-sm">
           {n} / {g.images.length}
         </span>
       )}

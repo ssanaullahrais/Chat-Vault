@@ -1,12 +1,12 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Copy, ExternalLink, File as FileIcon, FileAudio, FileCode2, FileImage, FileText, FileVideo, FolderOpen, Loader2 } from "lucide-react";
+import { Check, Copy, ExternalLink, File as FileIcon, FileAudio, FileCode2, FileImage, FileText, FileVideo, FolderOpen, Loader2, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { CodeBlock, CodeBlockContent, CodeBlockLine } from "@/components/ui/code-block";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useHighlightedCode } from "@/hooks/use-highlighted-code";
-import { fmtSize } from "@/chat-actions";
-import { notifyError } from "@/toast";
+import { fmtSize, saveWithDialog } from "@/chat-actions";
+import { notify, notifyError, runAction } from "@/toast";
 
 type FileData = { path: string; content: string; size: number; truncated: boolean; modifiedMs: number | null };
 type FileInfo = { path: string; size: number; kind: "text" | "image" | "video" | "audio" | "pdf" | "other"; ext: string; modifiedMs: number | null };
@@ -19,7 +19,7 @@ const MIME: Record<string, string> = {
 };
 
 /** Loads a picture, video, sound or PDF from disk and gives back a URL the page can show, cleaned up when the file changes. */
-function useMediaUrl(info: FileInfo | null, base: string | null) {
+function useMediaUrl(info: FileInfo | null, base: string | null, quiet = false) {
   const [url, setUrl] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
@@ -37,13 +37,13 @@ function useMediaUrl(info: FileInfo | null, base: string | null) {
       .catch((e) => {
         if (stale) return;
         setErr(String(e));
-        notifyError(e);
+        if (!quiet) notifyError(e);
       });
     return () => {
       stale = true;
       if (made) URL.revokeObjectURL(made);
     };
-  }, [info, base]);
+  }, [info, base, quiet]);
   return { url, err };
 }
 
@@ -51,6 +51,29 @@ const KIND_ICON = { text: FileCode2, image: FileImage, video: FileVideo, audio: 
 
 export const FileViewContext = createContext<{ base: string | null; open: (path: string) => void }>({ base: null, open: () => {} });
 export const useFileView = () => useContext(FileViewContext);
+
+export function LocalImageThumbnail({ path, title }: { path: string; title: string }) {
+  const { base, open } = useFileView();
+  const [info, setInfo] = useState<FileInfo | null>(null);
+  const { url } = useMediaUrl(info, base, true);
+  useEffect(() => {
+    let stale = false;
+    setInfo(null);
+    invoke<FileInfo>("file_info", { path, base })
+      .then((file) => {
+        if (!stale && file.kind === "image" && file.size <= 4_000_000
+          && /^(png|jpe?g|gif|webp|bmp|avif)$/i.test(file.ext)) setInfo(file);
+      })
+      .catch(() => {});
+    return () => { stale = true; };
+  }, [path, base]);
+  return (
+    <button type="button" aria-label={`Open ${title}`} title={title} onClick={() => open(path)}
+      className="grid size-20 shrink-0 cursor-zoom-in place-items-center overflow-hidden rounded-lg border bg-muted/30 focus-visible:ring-2 focus-visible:ring-ring">
+      {url ? <img src={url} alt="" className="size-full object-cover" /> : <FileImage className="size-5 text-muted-foreground" />}
+    </button>
+  );
+}
 
 /** File types that count as a file name even without a folder in front of them, like `report.pdf` or `chatvault-image-1.png`. */
 const KNOWN =
@@ -70,11 +93,18 @@ export function isFilePath(text: string) {
 const LANG: Record<string, string> = { ts: "typescript", tsx: "tsx", js: "javascript", jsx: "jsx", mjs: "javascript", cjs: "javascript", json: "json", md: "markdown", css: "css", scss: "css", html: "html", htm: "html", py: "python", sh: "bash", ps1: "bash", yml: "yaml", yaml: "yaml", sql: "sql", php: "text", rs: "text", go: "text", vue: "html", svelte: "html" };
 const langOf = (p: string) => LANG[(p.split(".").pop() || "").toLowerCase()] ?? "text";
 
-function Code({ code, lang }: { code: string; lang: string }) {
+export function pastedTextTitle(text: string) {
+  const firstLine = text.trimStart().split(/\r?\n/, 1)[0].replace(/^#{1,6}\s+/, "").trimEnd();
+  const title = firstLine.match(/^.{1,64}/u)?.[0];
+  if (!title) return "Pasted text";
+  return title.length < firstLine.length ? `${title.trimEnd()}…` : title;
+}
+
+function Code({ code, lang, wrap = false }: { code: string; lang: string; wrap?: boolean }) {
   const lines = useHighlightedCode(code, lang);
   return (
-    <CodeBlock size="sm" className="min-h-0 flex-1">
-      <CodeBlockContent data-lenis-prevent lineNumbers className="max-h-[68vh]">
+    <CodeBlock data-lenis-prevent size={wrap ? "default" : "sm"} className="min-h-0 flex-1">
+      <CodeBlockContent wrap={wrap} lineNumbers className={wrap ? undefined : "max-h-[68vh]"} scrollViewportClassName={wrap ? "max-h-[68vh]" : undefined}>
         {lines.map((line, i) => (
           <CodeBlockLine key={i}>{line}</CodeBlockLine>
         ))}
@@ -84,7 +114,7 @@ function Code({ code, lang }: { code: string; lang: string }) {
 }
 
 /** A look at a file a chat mentioned: code with colours, pictures, video, sound and PDFs shown right here. Anything else can be opened or shown in its folder. */
-export function FileViewer({ path, base, hints, onClose }: { path: string | null; base: string | null; hints?: string[]; onClose: () => void }) {
+export function FileViewer({ path, base, hints, pastedText = null, onClose }: { path: string | null; base: string | null; hints?: string[]; pastedText?: string | null; onClose: () => void }) {
   const [info, setInfo] = useState<FileInfo | null>(null);
   const [data, setData] = useState<FileData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -123,31 +153,40 @@ export function FileViewer({ path, base, hints, onClose }: { path: string | null
       await navigator.clipboard.writeText(value);
       setCopied(what);
       window.setTimeout(() => setCopied(null), 1400);
-    } catch {
-      /* clipboard can be blocked */
+    } catch (e) {
+      notifyError(e);
     }
   };
   const act = (cmd: "open_file_default" | "reveal_file") => info && invoke(cmd, { path: info.path, base }).catch((e) => notifyError(e));
-  const name = (info?.path ?? path ?? "").split(/[\\/]/).pop() ?? "";
+  const name = pastedText !== null ? pastedTextTitle(pastedText) : (info?.path ?? path ?? "").split(/[\\/]/).pop() ?? "";
   const lines = data ? data.content.split("\n").length : 0;
-  const Icon = info ? KIND_ICON[info.kind] : FileCode2;
+  const Icon = pastedText !== null ? FileText : info ? KIND_ICON[info.kind] : FileCode2;
   const wide = info && (info.kind === "video" || info.kind === "pdf" || info.kind === "image");
 
   return (
-    <Dialog open={!!path} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className={`flex max-h-[90dvh] flex-col gap-3 ${wide ? "sm:max-w-5xl" : "sm:max-w-4xl"}`}>
+    <Dialog open={!!path || pastedText !== null} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className={`flex max-h-[90dvh] flex-col gap-3 ${pastedText !== null ? "w-[calc(100%-2rem)] sm:max-w-2xl" : wide ? "sm:max-w-5xl" : "sm:max-w-4xl"}`}>
         <DialogHeader>
-          <div className="flex items-start gap-3 pr-6">
+          <div className="flex flex-wrap items-start gap-3 pr-6">
             <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
               <Icon className="size-4 text-muted-foreground" strokeWidth={1.5} />
             </div>
             <div className="min-w-0 flex-1">
               <DialogTitle className="truncate text-base font-medium">{name || "File"}</DialogTitle>
-              <DialogDescription className="truncate font-mono text-xs" title={info?.path}>
-                {info?.path ?? path}
+              <DialogDescription className="truncate text-xs" title={info?.path}>
+                {pastedText !== null ? "Pasted text · Markdown" : <span className="font-mono">{info?.path ?? path}</span>}
               </DialogDescription>
             </div>
-            {info && (
+            {pastedText !== null ? (
+              <div className="flex shrink-0 gap-1.5">
+                <Button size="sm" variant="outline" onClick={() => void copy("text", pastedText)}>
+                  {copied === "text" ? <Check className="size-3.5" /> : <Copy className="size-3.5" />} {copied === "text" ? "Copied" : "Copy"}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => void runAction("Saving pasted text", () => saveWithDialog("pasted-text", pastedText, notify))}>
+                  <Save className="size-3.5" /> Save .md
+                </Button>
+              </div>
+            ) : info && (
               <div className="flex shrink-0 gap-1.5">
                 <Button size="sm" variant="outline" onClick={() => void copy("path", info.path)}>
                   {copied === "path" ? <Check className="size-3.5" /> : <Copy className="size-3.5" />} Path
@@ -164,12 +203,13 @@ export function FileViewer({ path, base, hints, onClose }: { path: string | null
             )}
           </div>
         </DialogHeader>
-        {!info && !error && (
+        {pastedText === null && !info && !error && (
           <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" /> Opening file…
           </div>
         )}
-        {info?.kind === "text" && data && (
+        {pastedText !== null && <Code code={pastedText} lang="text" wrap />}
+        {pastedText === null && info?.kind === "text" && data && (
           <>
             <Code code={data.content} lang={langOf(data.path)} />
             <p className="text-xs text-muted-foreground">

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Moon, RefreshCw, Square, Sun, X } from "lucide-react";
+import { DriveJobsStatus } from "@/drive-jobs";
 import { cn } from "@/lib/utils";
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -19,7 +20,7 @@ function Control({ label, onClick, danger, children }: { label: string; onClick:
 }
 
 /** Our own window bar: it blends with the app, drags the window, and drives the native minimize, maximize and close. */
-export function TitleBar({ title, actions, sidebarOpen, busy, dark, onRefresh, onTheme }: { title?: string; actions?: React.ReactNode; sidebarOpen: boolean; busy: boolean; dark: boolean; onRefresh: () => void; onTheme: () => void }) {
+export function TitleBar({ title, actions, sidebarOpen, busy, dark, onRefresh, onTheme, onDriveSettings }: { title?: string; actions?: React.ReactNode; sidebarOpen: boolean; busy: boolean; dark: boolean; onRefresh: () => void; onTheme: () => void; onDriveSettings: () => void }) {
   const [max, setMax] = useState(false);
 
   useEffect(() => {
@@ -39,8 +40,9 @@ export function TitleBar({ title, actions, sidebarOpen, busy, dark, onRefresh, o
       <p data-tauri-drag-region className={cn("pointer-events-none min-w-0 flex-1 truncate text-sm font-medium text-foreground transition-[padding] duration-300", !sidebarOpen && "pl-10")}>
         {title}
       </p>
-      {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
-      <div className="flex h-full items-center pr-2">
+      <div className="flex h-full shrink-0 items-center pr-2">
+        <DriveJobsStatus onSettings={onDriveSettings} />
+        {actions && <div className="mx-2 flex shrink-0 items-center gap-2">{actions}</div>}
         <Control label="Scan this PC for new chats" onClick={onRefresh}>
           <RefreshCw className={cn("size-3.5", busy && "animate-spin")} strokeWidth={1.5} />
         </Control>

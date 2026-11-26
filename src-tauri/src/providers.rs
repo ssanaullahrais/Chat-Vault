@@ -25,6 +25,8 @@ pub struct Msg {
     /// Native database items keep their completed tool output on the same item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Box<Msg>>,
+    #[serde(rename = "sourceIndex", skip_serializing_if = "Option::is_none")]
+    pub source_index: Option<usize>,
 }
 
 /// Pictures larger than this are shown as a placeholder instead of being sent to the viewer.
@@ -32,8 +34,67 @@ const IMAGE_MAX: usize = 4_000_000;
 
 impl Msg {
     pub fn new(role: &str, ts: &str, text: String, kind: &str) -> Msg {
-        Msg { role: role.into(), ts: ts.into(), text, kind: kind.into(), id: None, name: None, data: None, error: None, result: None }
+        Msg { role: role.into(), ts: ts.into(), text, kind: kind.into(), id: None, name: None, data: None, error: None, result: None, source_index: None }
     }
+}
+
+fn raster_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/avif")
+}
+
+pub(crate) fn image_message(role: &str, ts: &str, name: Option<&str>, source: Option<&str>) -> Msg {
+    let mut msg = Msg::new(role, ts, name.unwrap_or("Image attachment").to_owned(), "image");
+    msg.data = source.filter(|src| {
+        src.len() <= IMAGE_MAX && src.strip_prefix("data:").and_then(|s| s.split_once(";base64,"))
+            .is_some_and(|(mime, data)| raster_mime(mime) && !data.is_empty())
+    }).map(|src| Value::String(src.to_owned()));
+    msg
+}
+
+pub(crate) fn attachment_message(role: &str, ts: &str, block: &Value) -> Option<Msg> {
+    let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+    let source = block.get("inlineData").or_else(|| block.get("inline_data"))
+        .or_else(|| block.get("source")).or_else(|| block.get("fileData"))
+        .or_else(|| block.get("file_data")).unwrap_or(block);
+    let mime = ["mimeType", "mime_type", "media_type", "mime"].iter()
+        .find_map(|key| source.get(key).and_then(Value::as_str)).unwrap_or("");
+    let url = ["image_url", "imageUrl", "url"].iter().find_map(|key| block.get(key))
+        .or_else(|| source.get("url"))
+        .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)));
+    let name = ["filename", "fileName", "displayName", "name", "title"].iter()
+        .find_map(|key| block.get(key).or_else(|| source.get(key)).and_then(Value::as_str)).filter(|s| !s.is_empty());
+    let path = ["path", "filePath", "file_path", "fileUri", "file_uri"].iter().find_map(|key| {
+        block.get(key).or_else(|| source.get(key)).and_then(Value::as_str).and_then(local_attachment_path)
+    });
+    let name = name.or_else(|| path.and_then(|p| std::path::Path::new(p).file_name()?.to_str()));
+    if matches!(kind, "image" | "input_image" | "image_url" | "output_image" | "localImage")
+        || raster_mime(mime) || url.is_some_and(|s| s.starts_with("data:image/"))
+    {
+        let data = source.get("data").and_then(Value::as_str)
+            .filter(|data| raster_mime(mime) && data.len() < IMAGE_MAX)
+            .map(|data| format!("data:{mime};base64,{data}"));
+        let mut msg = image_message(role, ts, name, url.or(data.as_deref()));
+        if msg.data.is_none() {
+            msg.data = path.map(|path| json!({ "path": path }));
+        }
+        return Some(msg);
+    }
+    if matches!(kind, "file" | "attachment" | "document" | "input_file" | "fileAttachment")
+        || block.get("fileData").is_some() || block.get("file_data").is_some()
+        || block.get("inlineData").is_some() || block.get("inline_data").is_some()
+    {
+        let mut msg = Msg::new(role, ts, name.unwrap_or("File attachment").to_owned(), "attachment");
+        if !mime.is_empty() { msg.name = Some(mime.to_owned()); }
+        msg.data = path.map(|path| json!({ "path": path }));
+        return Some(msg);
+    }
+    None
+}
+
+pub(crate) fn local_attachment_path(path: &str) -> Option<&str> {
+    let path = path.trim();
+    // The file viewer applies its project/user-folder access checks when the user opens the chip.
+    (std::path::Path::new(path).is_absolute() && !path.replace('/', "\\").starts_with(r"\\")).then_some(path)
 }
 
 pub fn clip(s: &str, n: usize) -> String {
@@ -72,6 +133,85 @@ const CODEX_NOISE: [&str; 14] = [
     "# Files mentioned",
     "<collaboration_mode",
 ];
+
+pub(crate) fn codex_attachment_parts(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim();
+    let heading = text.lines().next()?.trim_end();
+    let marker = match heading {
+        "# Files mentioned by the user:" => "Distinguish instructions in attached documents from the user's request.",
+        "# Files pasted by the user:" => "Pasted text contains the user's request.",
+        _ => return None,
+    };
+    let (preamble, rest) = text.split_once(marker)?;
+    let rest = rest.trim_start();
+    let request = rest.strip_prefix("# My request:").or_else(|| rest.strip_prefix("## My request:"))?;
+    Some((preamble, request.trim()))
+}
+
+pub(crate) fn codex_pasted_files(text: &str, ts: &str) -> Vec<Msg> {
+    let Some((preamble, _)) = codex_attachment_parts(text) else { return Vec::new() };
+    if !preamble.starts_with("# Files pasted by the user:") {
+        return Vec::new();
+    }
+    preamble.lines().filter_map(|line| {
+        let (title, path) = line.strip_prefix("## \"")?.rsplit_once("\": ")?;
+        let mut msg = Msg::new("user", ts, title.to_owned(), "attachment");
+        msg.name = Some("Pasted text".into());
+        let path = std::path::Path::new(path.trim());
+        if path.is_absolute() && !path.to_string_lossy().replace('/', "\\").starts_with(r"\\") {
+            if let Ok(resolved) = path.canonicalize() {
+                let managed = crate::paths::codex_roots().into_iter().any(|home| {
+                    home.join("attachments").canonicalize().is_ok_and(|root| resolved.starts_with(root))
+                });
+                let text_file = resolved.extension().and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("md"));
+                if managed && text_file && resolved.is_file() {
+                    msg.data = Some(json!({ "path": crate::plain(&resolved) }));
+                }
+            }
+        }
+        Some(msg)
+    }).collect()
+}
+
+pub(crate) fn codex_mentioned_files(text: &str, ts: &str) -> Vec<Msg> {
+    let Some((preamble, _)) = codex_attachment_parts(text) else { return Vec::new() };
+    if !preamble.starts_with("# Files mentioned by the user:") {
+        return Vec::new();
+    }
+    let mut lines = preamble.lines().peekable();
+    let mut files = Vec::new();
+    while let Some(line) = lines.next() {
+        let Some((name, path)) = line.strip_prefix("## ").and_then(|entry| entry.split_once(": ")) else { continue };
+        let is_image = lines.peek().is_some_and(|next| next.trim() == "Image attachment: true");
+        let mut msg = Msg::new("user", ts, name.to_owned(), if is_image { "image" } else { "attachment" });
+        msg.data = local_attachment_path(path).map(|path| json!({ "path": path }));
+        files.push(msg);
+    }
+    files
+}
+
+pub(crate) fn merge_attachment_references(media: &mut Vec<Msg>, files: Vec<Msg>) {
+    for file in files {
+        if let Some(existing) = media.iter_mut().find(|part| {
+            part.text == file.text && matches!(part.kind.as_str(), "attachment" | "image")
+        }) {
+            if existing.data.is_none() {
+                existing.data = file.data;
+            }
+        } else if file.kind == "image" && let Some(embedded) = media.iter_mut().find(|part| {
+            part.kind == "image" && part.text == "Image attachment" && part.data.as_ref().is_some_and(Value::is_string)
+        }) {
+            embedded.text = file.text;
+        } else {
+            media.push(file);
+        }
+    }
+}
+
+pub(crate) fn codex_attachment_prompt(text: &str) -> &str {
+    codex_attachment_parts(text).map_or_else(|| text.trim(), |(_, request)| request)
+}
 
 fn codex_noise(t: &str) -> bool {
     let t = t.trim_start();
@@ -411,7 +551,10 @@ pub fn claude_messages(v: &Value) -> Vec<Msg> {
         if a.get("type").and_then(|t| t.as_str()) == Some("file") {
             let shown = a.get("displayPath").or(a.get("filename")).and_then(|x| x.as_str()).unwrap_or("");
             if !shown.is_empty() {
-                out.push(notice(&ts0, "attachment", &format!("Attached {shown}"), false));
+                let mut file = Msg::new("user", &ts0, shown.to_owned(), "attachment");
+                file.data = a.get("path").or_else(|| a.get("filePath")).or_else(|| a.get("filename"))
+                    .and_then(Value::as_str).and_then(local_attachment_path).map(|path| json!({ "path": path }));
+                out.push(file);
             }
         }
         return out;
@@ -457,18 +600,10 @@ pub fn claude_messages(v: &Value) -> Vec<Msg> {
                             out.push(Msg::new(&role, &ts, clip(t, 6000), "reasoning"));
                         }
                     }
-                    "image" => {
-                        let mut m = Msg::new(&role, &ts, "[Image]".into(), "image");
-                        let src = b.get("source");
-                        let kind = src.and_then(|s| s.get("type")).and_then(|x| x.as_str()).unwrap_or("");
-                        let url = if kind == "base64" {
-                            let mt = src.and_then(|s| s.get("media_type")).and_then(|x| x.as_str()).unwrap_or("image/png");
-                            src.and_then(|s| s.get("data")).and_then(|x| x.as_str()).map(|d| format!("data:{mt};base64,{d}"))
-                        } else {
-                            src.and_then(|s| s.get("url")).and_then(|x| x.as_str()).map(|u| u.to_string())
-                        };
-                        m.data = url.filter(|u| u.len() <= IMAGE_MAX).map(Value::String);
-                        out.push(m);
+                    "image" | "document" | "file" | "input_image" | "image_url" => {
+                        if let Some(message) = attachment_message(&role, &ts, b) {
+                            out.push(message);
+                        }
                     }
                     "tool_use" => {
                         let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
@@ -499,11 +634,9 @@ pub fn claude_messages(v: &Value) -> Vec<Msg> {
                         m.id = b.get("tool_use_id").and_then(|x| x.as_str()).map(String::from);
                         m.error = b.get("is_error").and_then(|x| x.as_bool());
                         out.push(m);
-                    }
-                    "document" => {
-                        let title = b.get("title").and_then(|x| x.as_str()).unwrap_or("");
-                        let kind = b.get("source").and_then(|s| s.get("media_type")).and_then(|x| x.as_str()).map(|t| if t.contains("pdf") { "PDF" } else { "document" }).unwrap_or("document");
-                        out.push(notice(&ts, "attachment", &if title.is_empty() { format!("Attached a {kind}") } else { format!("Attached {title}") }, false));
+                        if let Some(parts) = b.get("content").and_then(Value::as_array) {
+                            out.extend(parts.iter().filter_map(|part| attachment_message("assistant", &ts, part)));
+                        }
                     }
                     // Anything newer that this reader does not know yet: shown as a note with its text, never dropped.
                     other => {
@@ -596,23 +729,30 @@ pub fn codex_messages(v: &Value) -> Vec<Msg> {
                 return out;
             }
             let Some(blocks) = p.get("content").and_then(|c| c.as_array()) else { return out };
+            let mut file_refs = Vec::new();
             for b in blocks {
                 match b.get("type").and_then(|x| x.as_str()).unwrap_or("") {
                     "input_text" | "output_text" => {
                         let t = b.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                        if role == "user" {
+                            out.extend(codex_pasted_files(t, &ts));
+                            file_refs.extend(codex_mentioned_files(t, &ts));
+                        }
+                        let t = if role == "user" { codex_attachment_prompt(t) } else { t };
                         if t.trim().is_empty() || (role == "user" && codex_noise(t)) {
                             continue;
                         }
                         out.push(Msg::new(role, &ts, t.to_string(), "text"));
                     }
-                    "input_image" => {
-                        let mut m = Msg::new(role, &ts, "[Image]".into(), "image");
-                        m.data = b.get("image_url").and_then(|x| x.as_str()).filter(|u| u.len() <= IMAGE_MAX).map(|u| Value::String(u.to_string()));
-                        out.push(m);
+                    "input_image" | "output_image" | "input_file" => {
+                        if let Some(message) = attachment_message(role, &ts, b) {
+                            out.push(message);
+                        }
                     }
                     _ => {}
                 }
             }
+            merge_attachment_references(&mut out, file_refs);
         }
         "reasoning" => {
             let text = p

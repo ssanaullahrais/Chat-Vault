@@ -2,7 +2,7 @@
 //! manage it (upload, download, delete). Files are grouped into "entries": one chat with its pictures and files, or one
 //! of the few shared files (chat names, generated pictures, the OpenCode database).
 
-use crate::gdrive::{self, Remote};
+use crate::gdrive;
 use crate::paths::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -104,8 +104,6 @@ pub struct Entry {
     pub drive_bytes: u64,
     /// Names of the PCs that uploaded this entry.
     pub devices: Vec<String>,
-    /// Ids of the PCs that uploaded this entry, to list one backup's chats.
-    pub device_ids: Vec<String>,
     /// synced | upload | download | differs | unchecked
     pub status: String,
     /// The chat still exists in its own tool: deleting the backup does not lose it.
@@ -132,7 +130,7 @@ pub(crate) fn status_of(local: &Sizes, remote: &Sizes, drive_checked: bool) -> &
         match remote.get(rel) {
             None => only_local = true,
             Some((rs, rm)) => {
-                if rs != size || (rm - mtime).abs() >= 2000 {
+                if rs != size || rm != mtime {
                     differ = true;
                 }
             }
@@ -154,12 +152,11 @@ pub(crate) fn status_of(local: &Sizes, remote: &Sizes, drive_checked: bool) -> &
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Group {
     local: Sizes,
     remote: Sizes,
     devices: HashSet<String>,
-    device_ids: HashSet<String>,
     last: i64,
 }
 
@@ -203,15 +200,28 @@ fn known_chats() -> HashMap<(String, String), Known> {
 }
 
 /// The whole list. `drive` also reads what is in Google Drive (needs a connection; slower).
-pub fn entries(drive: bool) -> Result<Vec<Entry>, String> {
+pub fn entries(drive: bool, preview: Option<impl Fn(Vec<Entry>)>) -> Result<Vec<Entry>, String> {
     let root = backup_root().ok_or("There is no backup folder.")?;
     let checked = drive && gdrive::connected();
+    let known = known_chats();
     let mut groups: HashMap<(String, String), Group> = HashMap::new();
-    for (rel, _path, size, mtime) in gdrive::local_files(&root) {
-        let Some(unit) = unit_of(&rel) else { continue };
+    let mut files = 0;
+    gdrive::visit_local_files(&root, |(rel, _, size, mtime)| {
+        let Some(unit) = unit_of(&rel) else { return };
         let g = groups.entry(unit).or_default();
         g.last = g.last.max(mtime);
         g.local.insert(rel, (size, mtime));
+        files += 1;
+        if files == 32 || (files >= 512 && files % 512 == 0) {
+            if let Some(emit) = &preview {
+                emit(entries_from_groups(groups.clone(), &known, false));
+            }
+        }
+    });
+    if checked {
+        if let Some(emit) = &preview {
+            emit(entries_from_groups(groups.clone(), &known, false));
+        }
     }
     if checked {
         let (remote, names) = gdrive::remote_snapshot()?;
@@ -220,15 +230,24 @@ pub fn entries(drive: bool) -> Result<Vec<Entry>, String> {
             let g = groups.entry(unit).or_default();
             g.last = g.last.max(r.mtime);
             g.devices.insert(names.get(&r.device).cloned().unwrap_or_else(|| "A PC".into()));
-            g.device_ids.insert(r.device.clone());
             // The best copy of each file across PCs.
-            let better = g.remote.get(&r.rel).is_none_or(|(s, m)| (r.size, r.mtime) > (*s, *m));
+            let matches_local = g.local.get(&r.rel) == Some(&(r.size, r.mtime));
+            let better = g.remote.get(&r.rel).is_none_or(|(s, m)| {
+                matches_local || (g.local.get(&r.rel) != Some(&(*s, *m)) && (r.mtime, r.size) > (*m, *s))
+            });
             if better {
                 g.remote.insert(r.rel, (r.size, r.mtime));
             }
         }
     }
-    let known = known_chats();
+    Ok(entries_from_groups(groups, &known, checked))
+}
+
+fn entries_from_groups(
+    groups: HashMap<(String, String), Group>,
+    known: &HashMap<(String, String), Known>,
+    checked: bool,
+) -> Vec<Entry> {
     let mut out = Vec::with_capacity(groups.len());
     for ((provider, key), g) in groups {
         let info = known.get(&(provider.clone(), key.clone()));
@@ -247,7 +266,6 @@ pub fn entries(drive: bool) -> Result<Vec<Entry>, String> {
             drive_files: g.remote.len(),
             drive_bytes: g.remote.values().map(|(s, _)| *s as u64).sum(),
             devices: { let mut d: Vec<String> = g.devices.into_iter().collect(); d.sort(); d },
-            device_ids: g.device_ids.into_iter().collect(),
             last_ms: info.map(|k| k.last_ms).unwrap_or(0).max(g.last),
             original: info.is_some_and(|k| k.live),
             project: info.map(|k| k.project.clone()),
@@ -258,7 +276,7 @@ pub fn entries(drive: bool) -> Result<Vec<Entry>, String> {
         });
     }
     out.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then(a.title.cmp(&b.title)));
-    Ok(out)
+    out
 }
 
 fn provider_name(p: &str) -> &'static str {
@@ -314,7 +332,11 @@ fn tidy(root: &Path, files: &[PathBuf]) {
 }
 
 /// Deletes the copies of the given entries: this PC's backup copy (to the Recycle Bin) and/or the Google Drive copy.
-pub fn delete(units: &[UnitRef], local: bool, drive: bool) -> Result<gdrive::Removed, String> {
+pub fn delete(
+    units: &[UnitRef], local: bool, drive: bool,
+    stop: &std::sync::atomic::AtomicBool, retry: Option<&HashSet<String>>, scope: Option<&str>,
+    report: impl Fn(usize, usize) + Sync,
+) -> Result<gdrive::Removed, String> {
     let root = backup_root().ok_or("There is no backup folder.")?;
     let set: HashSet<(String, String)> = units.iter().map(|u| (u.provider.clone(), u.key.clone())).collect();
     if set.is_empty() {
@@ -324,191 +346,40 @@ pub fn delete(units: &[UnitRef], local: bool, drive: bool) -> Result<gdrive::Rem
         return Err("Google Drive is not connected.".into());
     }
     let mut out = gdrive::Removed::default();
-    let mut run = || -> Result<(), String> {
+    let run = || -> Result<(), String> {
         if drive {
-            out.drive_files = gdrive::delete_drive(&set)?;
+            if let Some(scope) = scope { gdrive::validate_scope(scope)?; }
+            gdrive::delete_drive(&set, &mut out, stop, retry, report)?;
+            if out.error.is_some() || out.stopped {
+                return Ok(());
+            }
         }
         if local {
             let files: Vec<(String, PathBuf)> = gdrive::local_files(&root).into_iter().filter(|(rel, ..)| unit_of(rel).is_some_and(|u| set.contains(&u))).map(|(rel, path, ..)| (rel, path)).collect();
             // Only files that are really inside the backup folder.
             let safe: Vec<&(String, PathBuf)> = files.iter().filter(|(_, p)| p.starts_with(&root)).collect();
             let paths: Vec<PathBuf> = safe.iter().map(|(_, p)| p.clone()).collect();
-            out.local_files = recycle_many(&paths)?;
+            match recycle_many(&paths) {
+                Ok(moved) => out.local_files = moved,
+                Err(error) if drive => {
+                    out.error = Some(error);
+                    out.failed = paths.len();
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
             out.failed = paths.len().saturating_sub(out.local_files);
             gdrive::forget_local(&safe.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>());
             tidy(&root, &paths);
         }
         Ok(())
     };
-    // A delete in Drive must not overlap a sync; a local-only delete does not touch Drive.
-    if drive {
-        gdrive::exclusive(|| run())?;
+    if drive && !local {
+        gdrive::scoped(&set, run)?;
     } else {
-        run()?;
+        gdrive::exclusive(|| crate::sync::exclusive(run))?;
     }
     Ok(out)
-}
-
-// ---------------------------------------------------------------- the list of backups
-
-/// One backup: this PC's backup folder, or one PC's backup in Google Drive.
-#[derive(Serialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct BackupSet {
-    /// "local", or "drive:<device id>".
-    pub id: String,
-    /// "local" | "drive"
-    pub kind: String,
-    /// The PC's name.
-    pub name: String,
-    /// The folder, for the backup on this PC.
-    pub path: Option<String>,
-    /// The Drive device id, for a Drive backup.
-    pub device: Option<String>,
-    pub this_pc: bool,
-    pub files: usize,
-    pub bytes: u64,
-    /// Chats in it (shared files such as chat names are not counted).
-    pub chats: usize,
-    pub last_ms: Option<i64>,
-    /// Chats that are nowhere else: not in their tool, not in any other backup. Deleting this backup loses them.
-    pub only_copy: usize,
-    /// For this PC's Drive backup: files here not uploaded yet. For another PC's: its files not downloaded here yet.
-    pub pending: usize,
-    /// For the backup on this PC: files in it that are not in the tools yet ("Restore missing" copies them).
-    pub restorable: usize,
-}
-
-fn is_chat(unit: &(String, String)) -> bool {
-    shared_label(&unit.0, &unit.1).is_none() && !unit.1.ends_with("-files")
-}
-
-/// This PC's backup folder first, then each PC's backup in Google Drive (this PC's first). `drive` reads Drive too.
-pub fn sets(drive: bool) -> Result<Vec<BackupSet>, String> {
-    let root = backup_root().ok_or("There is no backup folder.")?;
-    let local = gdrive::local_files(&root);
-    let status = crate::sync::status();
-    let me = gdrive::this_device();
-    let pc = gdrive::this_pc_name();
-    let (skip_up, skip_down) = gdrive::skips();
-
-    // Which backups hold each chat, to find the ones a delete would lose.
-    let mut holders: HashMap<(String, String), HashSet<String>> = HashMap::new();
-    let mut here = BackupSet {
-        id: "local".into(),
-        kind: "local".into(),
-        name: pc.clone(),
-        path: Some(root.to_string_lossy().to_string()),
-        this_pc: true,
-        last_ms: status.last_sync_ms,
-        restorable: crate::sync::restore_preview(),
-        ..Default::default()
-    };
-    let mut local_sizes: HashMap<&str, (i64, i64)> = HashMap::new();
-    for (rel, _, size, mtime) in &local {
-        here.files += 1;
-        here.bytes += *size as u64;
-        local_sizes.insert(rel.as_str(), (*size, *mtime));
-        if let Some(u) = unit_of(rel) {
-            holders.entry(u).or_default().insert("local".into());
-        }
-    }
-
-    let mut out = Vec::new();
-    if drive && gdrive::connected() {
-        let all = gdrive::drive_listing()?;
-        let devices = gdrive::device_files(&all);
-        let mut by_dev: HashMap<String, BackupSet> = HashMap::new();
-        let mut mine: HashMap<String, (i64, i64)> = HashMap::new();
-        for r in all.iter().filter_map(gdrive::remote_of_pub) {
-            let set = by_dev.entry(r.device.clone()).or_insert_with(|| BackupSet { id: format!("drive:{}", r.device), kind: "drive".into(), device: Some(r.device.clone()), this_pc: r.device == me, ..Default::default() });
-            set.files += 1;
-            // What it takes up in Drive (compressed), the same figure Google shows.
-            set.bytes += (if r.bytes > 0 { r.bytes } else { r.size }).max(0) as u64;
-            set.last_ms = Some(set.last_ms.unwrap_or(0).max(r.mtime));
-            if let Some(u) = unit_of(&r.rel) {
-                holders.entry(u).or_default().insert(set.id.clone());
-            }
-            if r.device == me {
-                mine.insert(r.rel.clone(), (r.size, r.mtime));
-            } else if !local_sizes.contains_key(r.rel.as_str()) && skip_down.get(&r.rel) != Some(&r.version()) {
-                set.pending += 1;
-            }
-        }
-        // A PC whose device file is there but whose files were all removed still shows, empty.
-        for (id, (name, at, _)) in &devices {
-            let set = by_dev.entry(id.clone()).or_insert_with(|| BackupSet { id: format!("drive:{id}"), kind: "drive".into(), device: Some(id.clone()), this_pc: *id == me, ..Default::default() });
-            set.name = name.clone();
-            if at.is_some() {
-                set.last_ms = *at;
-            }
-        }
-        for set in by_dev.values_mut() {
-            if set.this_pc {
-                set.name = pc.clone();
-                // This PC's files that are not in its Drive backup yet (and were not left out on purpose).
-                set.pending = local
-                    .iter()
-                    .filter(|(rel, _, size, mtime)| {
-                        let up = mine.get(rel).is_some_and(|(s, m)| s == size && (m - mtime).abs() < 2000);
-                        !up && skip_up.get(rel) != Some(&(*size, *mtime))
-                    })
-                    .count();
-            } else if set.name.is_empty() {
-                set.name = "A PC".into();
-            }
-        }
-        let mut drive_sets: Vec<BackupSet> = by_dev.into_values().collect();
-        drive_sets.sort_by(|a, b| b.this_pc.cmp(&a.this_pc).then(b.last_ms.cmp(&a.last_ms)).then(a.name.cmp(&b.name)));
-        out.push(here);
-        out.extend(drive_sets);
-    } else {
-        out.push(here);
-    }
-
-    // Chats per backup, and the ones only that backup has.
-    let live: HashSet<(String, String)> = known_chats().into_iter().filter(|(_, k)| k.live).map(|(u, _)| u).collect();
-    for set in out.iter_mut() {
-        for (u, h) in &holders {
-            if !is_chat(u) || !h.contains(&set.id) {
-                continue;
-            }
-            set.chats += 1;
-            if h.len() == 1 && !live.contains(u) {
-                set.only_copy += 1;
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Moves this PC's whole backup to the Recycle Bin (every file ChatVault put in the backup folder). The chats in the
-/// tools and the Google Drive backups are not touched.
-pub fn delete_local_all() -> Result<gdrive::Removed, String> {
-    if crate::sync::BUSY.load(std::sync::atomic::Ordering::SeqCst) || gdrive::busy() {
-        return Err("A backup or sync is running. Try again when it finishes.".into());
-    }
-    let root = backup_root().ok_or("There is no backup folder.")?;
-    let files: Vec<(String, PathBuf)> = gdrive::local_files(&root).into_iter().filter(|(_, p, ..)| p.starts_with(&root)).map(|(r, p, ..)| (r, p)).collect();
-    let paths: Vec<PathBuf> = files.iter().map(|(_, p)| p.clone()).collect();
-    let moved = recycle_many(&paths)?;
-    gdrive::forget_local(&files.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>());
-    tidy(&root, &paths);
-    // "Last backed up" no longer describes anything that is there.
-    let _ = fs::remove_file(root.join(".chatvault-sync.json"));
-    Ok(gdrive::Removed { local_files: moved, drive_files: 0, failed: paths.len().saturating_sub(moved) })
-}
-
-/// The chats of one backup, for "Download to this PC": every entry that PC has in Drive.
-pub fn device_units(device: &str) -> Result<HashSet<(String, String)>, String> {
-    let all = gdrive::drive_listing()?;
-    Ok(all.iter().filter_map(gdrive::remote_of_pub).filter(|r| r.device == device).filter_map(|r| unit_of(&r.rel)).collect())
-}
-
-/// Where the remote file of an entry is, for the tests and the UI's "which PC" text.
-#[allow(dead_code)]
-fn remote_units(remote: &[Remote]) -> HashSet<(String, String)> {
-    remote.iter().filter_map(|r| unit_of(&r.rel)).collect()
 }
 
 #[cfg(test)]
@@ -520,6 +391,28 @@ mod tests {
     }
     fn pair(a: &str, b: &str) -> Option<(String, String)> {
         Some((a.to_string(), b.to_string()))
+    }
+
+    #[test]
+    #[ignore = "uses the Windows Recycle Bin"]
+    fn local_delete_recycles_only_the_selected_file() {
+        let root = std::env::temp_dir().join(format!(
+            "chatvault-recycle-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let selected = root.join("disposable backup.jsonl");
+        let retained = root.join("disposable original.jsonl");
+        fs::write(&selected, b"test backup").unwrap();
+        fs::write(&retained, b"test original").unwrap();
+
+        assert_eq!(recycle_many(&[selected.clone()]).unwrap(), 1);
+        assert!(!selected.exists());
+        assert_eq!(fs::read(&retained).unwrap(), b"test original");
+
+        fs::remove_file(&retained).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -550,7 +443,7 @@ mod tests {
     fn status_says_what_is_where() {
         let a = sizes(&[("f1", 10, 1000), ("f2", 5, 2000)]);
         assert_eq!(status_of(&a, &a, true), "synced");
-        assert_eq!(status_of(&a, &sizes(&[("f1", 10, 1500), ("f2", 5, 2000)]), true), "synced", "a second of clock drift is not a difference");
+        assert_eq!(status_of(&a, &sizes(&[("f1", 10, 1500), ("f2", 5, 2000)]), true), "differs", "modified timestamps distinguish file versions");
         assert_eq!(status_of(&a, &Sizes::new(), true), "upload");
         assert_eq!(status_of(&Sizes::new(), &a, true), "download");
         assert_eq!(status_of(&a, &sizes(&[("f1", 10, 1000)]), true), "upload", "part of it is not in Drive yet");

@@ -1,4 +1,4 @@
-import { FileViewContext, FileViewer, isFilePath } from "@/file-viewer";
+import { FileViewContext, FileViewer, LocalImageThumbnail, isFilePath, pastedTextTitle, useFileView } from "@/file-viewer";
 import { StickyOpenContext, useStickyOpen } from "@/sticky-open";
 import { ChatImage, GalleryContext, Lightbox } from "@/image-viewer";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -24,6 +24,7 @@ import {
   HardDrive,
   MessageSquare,
   Copy,
+  FileCode2,
   FileText,
   ListTree,
   Loader2,
@@ -67,7 +68,7 @@ import { cn } from "@/lib/utils";
 import { ProviderLogo } from "@/claude-logo";
 import { MessageBody } from "@/message-body";
 import { Highlight, textHas } from "@/highlight";
-import { PROVIDER_SHORT, chatActions, continueTargets, COPY_CONTENT_IDS, deleteKind, fmtDate, fmtSize, prettyTitle, type Chat, type ChatAction, type Msg, type MsgPage, type Provider } from "@/chat-actions";
+import { PROVIDER_SHORT, chatActions, continueTargets, COPY_CONTENT_IDS, deleteKind, fmtDate, fmtSize, prettyTitle, saveWithDialog, type Chat, type ChatAction, type Msg, type MsgPage, type Provider } from "@/chat-actions";
 import { HeaderSkeleton, MessagesSkeleton } from "@/skeletons";
 import { CardBlock, PlanBlock, StepItem, SubagentBlock, isAgent, isPlan, mergeResults, type Item } from "@/steps";
 import { isCard, nextPlan, summarize, type PlanStep } from "@/step-summary";
@@ -122,6 +123,7 @@ export function ChatView(p: Props) {
   const [loadingAll, setLoadingAll] = useState(false);
   const [viewer, setViewer] = useState<number | null>(null);
   const [fileOpen, setFileOpen] = useState<string | null>(null);
+  const [pastedText, setPastedText] = useState<string | null>(null);
   // Full paths the chat itself mentions. A short path like src/app.tsx is looked up under the folders they point into,
   // so it still opens when the chat worked on a project other than its own folder.
   const fileHints = useMemo(() => {
@@ -139,7 +141,10 @@ export function ChatView(p: Props) {
     return [...seen];
   }, [fileOpen, page]);
   const fileCtx = useMemo(() => ({ base: chat.cwd ?? null, open: (path: string) => setFileOpen(path) }), [chat.cwd]);
-  useEffect(() => setFileOpen(null), [chat.id]);
+  useEffect(() => {
+    setFileOpen(null);
+    setPastedText(null);
+  }, [chat.id]);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -196,9 +201,13 @@ export function ChatView(p: Props) {
       } else {
         // Pictures and the text sent together (the same second) are one message: the text sits right under the pictures.
         const last = out[out.length - 1];
-        const kindOk = (x: Item) => x.kind === "image" || x.kind === "text";
-        const together =
-          m.role === "user" && kindOk(m) && last?.kind === "msg" && last.m.role === "user" && kindOk(last.m) && !!m.ts && m.ts.slice(0, 19) === last.m.ts.slice(0, 19) && (m.kind === "image" || last.m.kind === "image") && m.name !== "queued" && last.m.name !== "queued";
+        const kindOk = (x: Item) => x.kind === "image" || x.kind === "attachment" || x.kind === "text";
+        const together = last?.kind === "msg" && m.role === last.m.role && m.role !== "system"
+          && kindOk(m) && kindOk(last.m)
+          && (m.sourceIndex !== undefined && last.m.sourceIndex !== undefined
+            ? m.sourceIndex === last.m.sourceIndex
+            : !!m.ts && m.ts.slice(0, 19) === last.m.ts.slice(0, 19))
+          && (m.kind !== "text" || last.m.kind !== "text") && m.name !== "queued" && last.m.name !== "queued";
         if (together && last?.kind === "msg") {
           last.also = [...(last.also ?? []), m];
           last.alsoAt = [...(last.alsoAt ?? []), i];
@@ -721,13 +730,13 @@ export function ChatView(p: Props) {
                       {b.kind === "plan" ? (
                         <PlanBlock steps={b.steps} memoKey={String(vi.key)} />
                       ) : b.kind === "card" ? (
-                        <CardBlock item={b.m} />
+                        <CardBlock item={b.m} provider={chat.provider} />
                       ) : b.kind === "agent" ? (
                         <SubagentBlock item={b.m} memoKey={String(vi.key)} />
                       ) : b.kind === "trace" ? (
                         <StepsTrace items={b.items} q={query} rowKey={String(vi.key)} />
                       ) : (
-                        <MessageRow m={b.m} provider={chat.provider} q={query} isCurrentMatch={matchIndex >= 0 && matches[matchIndex] === b.i} toast={p.toast} rowKey={String(vi.key)} continued={continued} also={b.also} />
+                        <MessageRow m={b.m} provider={chat.provider} q={query} isCurrentMatch={matchIndex >= 0 && matches[matchIndex] === b.i} toast={p.toast} rowKey={String(vi.key)} continued={continued} also={b.also} onOpenPastedText={setPastedText} />
                       )}
                     </div>
                   );
@@ -786,7 +795,10 @@ export function ChatView(p: Props) {
         )}
       </div>
     </div>
-      <FileViewer path={fileOpen} base={chat.cwd ?? null} hints={fileHints} onClose={() => setFileOpen(null)} />
+      <FileViewer path={fileOpen} base={chat.cwd ?? null} hints={fileHints} pastedText={pastedText} onClose={() => {
+        setFileOpen(null);
+        setPastedText(null);
+      }} />
     </ContextArea>
     </StickyOpenContext.Provider>
     </FileViewContext.Provider>
@@ -936,7 +948,8 @@ const StepsTrace = memo(function StepsTrace({ items, q, rowKey }: { items: { i: 
   );
 });
 
-const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, toast, rowKey, continued = false, also }: { m: Msg; provider: Provider; q: string; isCurrentMatch: boolean; toast: (m: string) => void; rowKey: string; continued?: boolean; also?: Msg[] }) {
+const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, toast, rowKey, continued = false, also, onOpenPastedText }: { m: Msg; provider: Provider; q: string; isCurrentMatch: boolean; toast: (m: string) => void; rowKey: string; continued?: boolean; also?: Msg[]; onOpenPastedText: (text: string) => void }) {
+  const fileView = useFileView();
   const [open, setOpen] = useStickyOpen(rowKey);
   const [copied, setCopied] = useState<string | null>(null);
   const time = m.ts ? new Date(m.ts).toLocaleTimeString(undefined, { timeStyle: "short" }) : "";
@@ -991,11 +1004,18 @@ const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, to
   }
 
   // This message and anything sent with it in the same second (pictures, then text).
-  const parts = [m, ...(also ?? [])].sort((a, b) => Number(b.kind === "image") - Number(a.kind === "image"));
-  const copyText = parts.filter((x) => x.kind !== "image").map((x) => x.text).join("\n\n");
-  // Messages are always shown in full, as in the AI apps (no "Show all" to click).
-  const long = false;
-  const text = m.text;
+  const parts = [m, ...(also ?? [])];
+  const images = parts.flatMap((part) => part.kind === "image" && typeof part.data === "string" ? [part.data] : []);
+  const localImages = parts.flatMap((part) => {
+    const path = attachmentPath(part);
+    return path && (part.kind === "image" || (part.kind === "attachment" && /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(path)))
+      ? [{ part, path }] : [];
+  });
+  const attachments = parts.filter((part) => part.kind === "attachment" && !localImages.some((image) => image.part === part));
+  const imageCount = images.length + localImages.length;
+  const body = parts.filter((part) => part.kind !== "image" || typeof part.data !== "string")
+    .sort((a, b) => Number(b.kind !== "text") - Number(a.kind !== "text"));
+  const copyText = body.filter((x) => x.kind !== "image").map((x) => x.text).join("\n\n");
   const copy = async (what: string, value: string) => {
     try {
       await navigator.clipboard.writeText(value);
@@ -1032,30 +1052,88 @@ const MessageRow = memo(function MessageRow({ m, provider, q, isCurrentMatch, to
             </MiniAction>
           </div>
         </MessageHeader>
-        {/* Pictures first, then the text that was sent with them, all in this one message. */}
-        {parts.map((part, pi) =>
-          part.kind === "image" && typeof part.data === "string" ? (
-            <div key={pi} className={cn("max-w-full", isUser && "flex justify-end")}>
-              <ChatImage src={part.data} />
-            </div>
-          ) : (
-            <Bubble key={pi} variant={isUser ? "secondary" : "outline"} className="max-w-full">
-              <BubbleContent className="overflow-visible">
-                {part.kind === "image" ? <span className="text-muted-foreground">[Image]</span> : <MessageBody text={part === m ? text : part.text} q={q} active={isCurrentMatch} assistant={!isUser} />}
-                {part === m && long && !q && (
-                  <button className="mt-1 text-xs text-muted-foreground underline" onClick={() => setOpen((o) => !o)}>
-                    {open ? "Show less" : "Show all"}
-                  </button>
-                )}
-              </BubbleContent>
-            </Bubble>
-          ),
+        {imageCount > 0 && (
+          <div
+            role={imageCount > 1 ? "group" : undefined}
+            aria-label={imageCount > 1 ? "Image attachments" : undefined}
+            className={cn("flex max-w-full flex-wrap gap-2", isUser && "justify-end")}
+          >
+            {images.map((src, i) => <ChatImage key={i} src={src} thumbnail={imageCount > 1 || (isUser && attachments.length > 0)} trimScreenshotMargin={!isUser} />)}
+            {localImages.map(({part, path}, i) => <LocalImageThumbnail key={`${i}:${path}`} path={path} title={part.text} />)}
+          </div>
         )}
+        {attachments.length > 0 && (
+          <div role="group" aria-label="File attachments" className={cn("flex max-w-full flex-wrap gap-1.5", isUser && "justify-end")}>
+            {attachments.map((attachment, i) => {
+              const path = attachmentPath(attachment);
+              const title = attachment.text || "File attachment";
+              const Icon = /\.(py|html?|tsx?|jsx?|rs|css|json|sql|sh|ps1)$/i.test(title) ? FileCode2 : FileText;
+              const label = <><Icon className="size-3.5 shrink-0 text-muted-foreground" /><span className="truncate">{title}</span></>;
+              return path ? (
+                <Button key={i} variant="outline" size="sm" className="min-w-0 max-w-[min(100%,16rem)] justify-start rounded-full text-xs" title={title} onClick={() => fileView.open(path)}>
+                  {label}
+                </Button>
+              ) : (
+                <span key={i} className="inline-flex h-7 min-w-0 max-w-[min(100%,16rem)] items-center gap-1.5 rounded-full border px-2.5 text-xs text-muted-foreground" title={`${title} · Preview unavailable`}>
+                  {label}
+                </span>
+              );
+            })}
+          </div>
+        )}
+        {body.filter((part) => part.kind !== "attachment" && !localImages.some((image) => image.part === part)).map((part, pi) => isUser && part.kind === "text" && (part.text.length >= 2_000 || part.text.split("\n", 24).length === 24) ? (
+          <div key={pi} className={cn(
+            "w-full min-w-0 self-end overflow-hidden rounded-xl border bg-background",
+            q && textHas(part.text, q) && "border-ring",
+          )}>
+            <div className="px-3 py-2">
+              <p className="line-clamp-5 whitespace-pre-wrap wrap-anywhere text-sm leading-relaxed">
+                <Highlight text={part.text.slice(0, 1_200).split("\n", 5).join("\n")} q={q} activeMark={isCurrentMatch} />
+              </p>
+            </div>
+            <div className="flex items-center gap-1 border-t p-1.5">
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md p-1 text-left hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+                onClick={() => onOpenPastedText(part.text)}
+              >
+                <span className="grid size-8 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
+                  <FileText className="size-4" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium">{pastedTextTitle(part.text)}</span>
+                  <span className="block text-xs text-muted-foreground">View full text</span>
+                </span>
+              </button>
+              <MiniAction label={copied === `paste-${pi}` ? "Copied" : "Copy pasted text"} onClick={() => copy(`paste-${pi}`, part.text)}>
+                {copied === `paste-${pi}` ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+              </MiniAction>
+              <MiniAction label="Save pasted text as Markdown" onClick={() => runAction("Saving pasted text", () => saveWithDialog("pasted-text", part.text, toast))}>
+                <Save className="size-3.5" />
+              </MiniAction>
+            </div>
+          </div>
+        ) : (
+          <Bubble key={pi} variant={isUser ? "secondary" : "outline"} className="max-w-full">
+            <BubbleContent className="overflow-visible">
+              {part.kind === "image" ? (
+                <span className="block max-w-full text-sm">
+                  <span className="block break-words font-medium">{part.text}</span>
+                  <span className="block text-xs text-muted-foreground">Image preview unavailable</span>
+                </span>
+              ) : <MessageBody text={part.text} q={q} active={isCurrentMatch} assistant={!isUser} />}
+            </BubbleContent>
+          </Bubble>
+        ))}
       </MessageContent>
     </Message>
   );
   // The toast callback changes identity on every render; it is deliberately left out so rows are not redrawn while scrolling.
-}, (a, b) => a.m === b.m && a.provider === b.provider && a.q === b.q && a.isCurrentMatch === b.isCurrentMatch && a.rowKey === b.rowKey && a.continued === b.continued && a.also === b.also);
+}, (a, b) => a.m === b.m && a.provider === b.provider && a.q === b.q && a.isCurrentMatch === b.isCurrentMatch && a.rowKey === b.rowKey && a.continued === b.continued && a.also === b.also && a.onOpenPastedText === b.onOpenPastedText);
+
+function attachmentPath(message: Msg) {
+  return typeof message.data === "object" && typeof message.data.path === "string" ? message.data.path : null;
+}
 
 function MiniAction({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
   return (

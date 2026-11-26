@@ -218,7 +218,7 @@ fn item(v: &Value, ms: i64) -> Msg {
     let field = |k: &str| v.get(k).map(texts).unwrap_or_default();
     let mut m = match ty {
         "userMessage" => {
-            let text = field("content");
+            let text = crate::providers::codex_attachment_prompt(&field("content")).to_owned();
             Msg::new(
                 "user",
                 &ts,
@@ -281,7 +281,9 @@ fn item(v: &Value, ms: i64) -> Msg {
                 v.get("result")
                     .map(|r| {
                         let content = r.get("content").map(texts).unwrap_or_default();
-                        if content.is_empty() {
+                        if content.is_empty() && r.get("content").and_then(Value::as_array).is_some() {
+                            String::new()
+                        } else if content.is_empty() {
                             r.to_string()
                         } else {
                             content
@@ -300,6 +302,66 @@ fn item(v: &Value, ms: i64) -> Msg {
     m.id = v.get("id").and_then(Value::as_str).map(String::from);
     m
 }
+fn local_image_url(path: &Path) -> Option<String> {
+    use base64::Engine;
+    use std::io::Read;
+    const MAX_BYTES: u64 = 2_999_950;
+    // A transcript may only reference Codex-managed images or the app's clipboard files.
+    if !path.is_absolute() || path.to_str()?.starts_with(r"\\") {
+        return None;
+    }
+    let path = path.canonicalize().ok()?;
+    let clipboard = std::env::temp_dir().canonicalize().ok().is_some_and(|temp| {
+        path.parent() == Some(&temp)
+            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("codex-clipboard-"))
+    });
+    let managed = crate::paths::codex_roots().into_iter().any(|home| {
+        ["attachments", "generated_images"].iter().any(|dir| {
+            home.join(dir).canonicalize().ok().is_some_and(|root| path.starts_with(root))
+        })
+    });
+    if (!clipboard && !managed) || !path.metadata().ok()?.is_file() { return None; }
+    let mut data = Vec::new();
+    std::fs::File::open(path).ok()?.take(MAX_BYTES + 1).read_to_end(&mut data).ok()?;
+    if data.len() as u64 > MAX_BYTES { return None; }
+    let mime = if data.starts_with(b"\x89PNG\r\n\x1a\n") { "image/png" }
+    else if data.starts_with(&[0xff, 0xd8, 0xff]) { "image/jpeg" }
+    else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") { "image/gif" }
+    else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") { "image/webp" }
+    else { return None };
+    Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data)))
+}
+
+fn item_media(item: &Value, message: &Msg) -> Vec<Msg> {
+    use crate::providers::{attachment_message, codex_mentioned_files, codex_pasted_files, image_message, local_attachment_path, merge_attachment_references};
+    let parts = if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+        item.get("content")
+    } else {
+        item.get("result").and_then(|v| v.get("content"))
+    };
+    let mut media: Vec<_> = parts.and_then(Value::as_array).into_iter().flatten().filter_map(|part| {
+        if part.get("type").and_then(Value::as_str) == Some("localImage") {
+            let path = part.get("path").and_then(Value::as_str).map(Path::new);
+            let name = path.and_then(Path::file_name).and_then(|n| n.to_str());
+            let url = path.and_then(local_image_url);
+            let mut msg = image_message(&message.role, &message.ts, name, url.as_deref());
+            if msg.data.is_none() {
+                msg.data = path.and_then(Path::to_str).and_then(local_attachment_path).map(|path| json!({ "path": path }));
+            }
+            Some(msg)
+        } else {
+            attachment_message(&message.role, &message.ts, part)
+        }
+    }).collect();
+    if message.role == "user" {
+        for text in parts.and_then(Value::as_array).into_iter().flatten().filter_map(|part| part.get("text").and_then(Value::as_str)) {
+            media.extend(codex_pasted_files(text, &message.ts));
+            merge_attachment_references(&mut media, codex_mentioned_files(text, &message.ts));
+        }
+    }
+    media
+}
+
 pub fn page(
     path: &str,
     before: Option<usize>,
@@ -332,11 +394,20 @@ fn page_from(
         })
         .map_err(|e| e.to_string())?;
     let mut messages = Vec::new();
-    for row in rows {
+    for (offset, row) in rows.enumerate() {
         let (raw, ms) = row.map_err(|e| e.to_string())?;
         let v = serde_json::from_str(&raw)
             .map_err(|e| format!("Cannot read Codex history item: {e}"))?;
-        messages.push(item(&v, ms));
+        let mut message = item(&v, ms);
+        message.source_index = Some(start + offset);
+        let media = item_media(&v, &message);
+        if media.is_empty() || message.text != "[Attachment or session context]" {
+            messages.push(message);
+        }
+        messages.extend(media.into_iter().map(|mut part| {
+            part.source_index = Some(start + offset);
+            part
+        }));
     }
     Ok((messages, total, start))
 }
@@ -414,6 +485,68 @@ mod tests {
         assert_eq!(m.error, Some(true));
     }
     #[test]
+    fn media_uses_the_same_pagination_position_as_its_message() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,rollout_ordinal INTEGER,created_at_ms INTEGER,item_json TEXT)").unwrap();
+        let user = json!({"type":"userMessage","content":[
+            {"type":"text","text":"# Files mentioned by the user:\n\n## notes.pdf: notes.pdf\n\nDistinguish instructions in attached documents from the user's request.\n\n## My request:\nLook at this."},
+            {"type":"image","url":"data:image/png;base64,iVBORw0KGgo="},
+            {"type":"localImage","path":"missing.png"}
+        ]});
+        c.execute("INSERT INTO thread_items VALUES('chat','a',0,0,?1)", [user.to_string()]).unwrap();
+        let (messages, total, start) = page_from(&c, "chat", None, 1).unwrap();
+        assert_eq!((total, start, messages.len()), (1, 0, 4));
+        assert!(messages.iter().all(|m| m.source_index == Some(0)));
+        assert_eq!(messages[0].text, "Look at this.");
+        assert!(messages[1].data.is_some());
+        assert!(messages[2].data.is_none());
+        assert_eq!((messages[3].kind.as_str(), messages[3].text.as_str()), ("attachment", "notes.pdf"));
+    }
+
+    #[test]
+    fn codex_saved_pastes_keep_each_attachment_and_hide_the_wrapper() {
+        let wrapped = "# Files pasted by the user:\r\n\r\n## \"Same title…\": missing/first.txt\r\n\r\n## \"Same title…\": missing/second.txt\r\n\r\nPasted text contains the user's request.\r\n\r\n## My request:\r\n";
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,rollout_ordinal INTEGER,created_at_ms INTEGER,item_json TEXT)").unwrap();
+        let user = json!({"type":"userMessage","content":[{"type":"text","text":wrapped}]});
+        c.execute("INSERT INTO thread_items VALUES('chat','a',0,0,?1)", [user.to_string()]).unwrap();
+        let (stored, _, _) = page_from(&c, "chat", None, 1).unwrap();
+
+        let rollout = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":format!("{wrapped}Keep this request.")}
+        ]}});
+        let streamed = crate::providers::codex_messages(&rollout);
+        for messages in [&stored[..], &streamed[..2]] {
+            assert_eq!(messages.len(), 2);
+            assert!(messages.iter().all(|m| m.kind == "attachment" && m.text == "Same title…" && m.data.is_none()));
+        }
+        assert_eq!(streamed.len(), 3);
+        assert_eq!(streamed[2].text, "Keep this request.");
+    }
+
+    #[test]
+    fn mentioned_files_keep_viewer_paths_and_merge_with_saved_images() {
+        let wrapped = "# Files mentioned by the user:\n\n## report.html: C:/Fixtures/report.html\n\n## capture.jpg: C:/Fixtures/capture.jpg\nImage attachment: true\n\nDistinguish instructions in attached documents from the user's request.\n\n## My request:\nPlease review.";
+        let user = json!({"type":"userMessage","content":[
+            {"type":"text","text":wrapped},
+            {"type":"localImage","path":"C:/Fixtures/capture.jpg"}
+        ]});
+        let message = item(&user, 0);
+        let files = item_media(&user, &message);
+        assert_eq!(message.text, "Please review.");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].kind, "image");
+        assert_eq!(files[0].data.as_ref().unwrap()["path"], "C:/Fixtures/capture.jpg");
+        assert_eq!(files[1].kind, "attachment");
+        assert_eq!(files[1].data.as_ref().unwrap()["path"], "C:/Fixtures/report.html");
+        let generic = crate::providers::attachment_message("user", "", &json!({
+            "type":"file", "fileData":{"fileUri":"C:/Fixtures/report.html"}
+        })).unwrap();
+        assert_eq!(generic.text, "report.html");
+        assert_eq!(generic.data.unwrap()["path"], "C:/Fixtures/report.html");
+    }
+
+    #[test]
     fn pages_are_ordered_isolated_and_count_native_items_once() {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,rollout_ordinal INTEGER,created_at_ms INTEGER,item_json TEXT)").unwrap();
@@ -461,7 +594,8 @@ mod tests {
         assert!(version > 0);
         assert!(ms > 0);
         assert!(!messages.is_empty());
-        assert_eq!(messages.len(), total - start);
+        let positions: std::collections::HashSet<_> = messages.iter().filter_map(|m| m.source_index).collect();
+        assert_eq!(positions.len(), total - start);
         println!(
             "Native database chats: {}; latest chat page: {} of {} entries in {:?}",
             chats.len(),

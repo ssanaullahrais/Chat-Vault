@@ -68,9 +68,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { SidebarSkeleton, MessagesSkeleton } from "@/skeletons";
 import { Splash } from "@/splash";
-import type { DriveStats, DriveStatus } from "@/gdrive-panel";
+import type { DriveStatus } from "@/gdrive-panel";
+import { resumeDriveJobs, startDriveJob } from "@/drive-jobs";
 import { TitleBar } from "@/titlebar";
 import { AUTO_SYNC_KEY } from "@/store";
+import { BACKUP_AUTO_ENABLED, invalidateBackups, readBackupEntries } from "@/backup-refresh";
 import { chatKey, useAccountNames, useChatMeta, usePersisted } from "@/store";
 import { RenameAccountDialog } from "@/rename-account-dialog";
 import { startAutoUpdate } from "@/updater";
@@ -250,50 +252,39 @@ export default function App() {
     if (!isTauri) return;
     const un = listen<IndexProg>("index-progress", (e) => setIndexing(e.payload.phase === "Done" ? null : e.payload));
     let cancelled = false;
-    // Google Drive, when connected and set to sync automatically. It runs quietly: offline or failing, the app carries on
-    // and Sync & backup shows what went wrong. Chats that arrived from other PCs are added to the list.
-    // Each time, Google is asked whether the connection still works: the access may have been removed in the Google
-    // account. Then the app says so once, instead of failing quietly.
-    let wasConnected: boolean | null = null;
-    const checkDrive = async () => {
-      const s = await invoke<DriveStatus>("gdrive_check").catch(() => null);
-      if (cancelled || !s) return s;
-      if (wasConnected && !s.connected && s.available) notifyError("Google Drive was disconnected because its access was removed in your Google account. Connect it again in Sync & backup.");
-      wasConnected = s.connected;
-      return s;
-    };
-    let lastCheck = 0;
-    const onFocus = () => {
-      if (Date.now() - lastCheck < 60_000) return;
-      lastCheck = Date.now();
-      void checkDrive();
-    };
-    window.addEventListener("focus", onFocus);
-    const driveSync = async () => {
-      lastCheck = Date.now();
-      const s = await checkDrive();
-      if (cancelled || !s?.connected || !s.autoSync || s.busy) return;
-      const r = await invoke<DriveStats>("gdrive_sync", { restore: false }).catch(() => null);
-      if (!cancelled && r && (r.downloaded > 0 || r.conflicts > 0)) await rescan();
-    };
-    // Paint cached chats first; StrictMode cleanup cancels the first scheduled run.
-    const startup = window.setTimeout(() => {
-      void (async () => {
-        await rescan();
+    // Drive sync already makes the local backup, so the scheduler runs only one of the two jobs.
+    let backingUp = false;
+    const backup = async () => {
+      if (cancelled || backingUp) return;
+      backingUp = true;
+      try {
+        const drive = await invoke<DriveStatus>("gdrive_status").catch(() => null);
         if (cancelled) return;
-        if (localStorage.getItem(AUTO_SYNC_KEY) !== "0") {
+        let changed = false;
+        let refreshBackups = false;
+        if (drive?.connected && drive.autoSync) {
+          await startDriveJob({ kind: "sync" }, rescan, true);
+          return;
+        } else if (localStorage.getItem(AUTO_SYNC_KEY) !== "0") {
           const result = await invoke<{ copied: number }>("sync_chats").catch(() => null);
-          if (!cancelled && result && result.copied > 0) await rescan();
+          changed = !!result?.copied;
+          refreshBackups = changed;
         }
-        await driveSync();
-      })();
+        if (cancelled) return;
+        if (changed) await rescan();
+        if (refreshBackups) invalidateBackups();
+      } finally {
+        backingUp = false;
+      }
+    };
+    const onAutoEnabled = () => void backup();
+    window.addEventListener(BACKUP_AUTO_ENABLED, onAutoEnabled);
+    const startup = window.setTimeout(() => {
+      void readBackupEntries().catch(() => {});
+      const resume = resumeDriveJobs(rescan).catch(notifyError);
+      void Promise.all([rescan(), resume]).then(backup);
     }, 750);
-    const every = window.setInterval(() => {
-      void (async () => {
-        if (localStorage.getItem(AUTO_SYNC_KEY) !== "0") await invoke("sync_chats").then(() => rescan()).catch(() => {});
-        await driveSync();
-      })();
-    }, 10 * 60 * 1000);
+    const every = window.setInterval(onAutoEnabled, 10 * 60 * 1000);
     const stopUpdates = startAutoUpdate();
     const offSync = listen("tray-sync", () => setSyncOpen(true));
     const offScan = listen("tray-rescan", () => void rescan());
@@ -301,7 +292,7 @@ export default function App() {
     const offSettings = listen("tray-settings", () => setSettingsOpen(true));
     return () => {
       cancelled = true;
-      window.removeEventListener("focus", onFocus);
+      window.removeEventListener(BACKUP_AUTO_ENABLED, onAutoEnabled);
       window.clearTimeout(startup);
       void un.then((f) => f());
       void offSync.then((f) => f());
@@ -633,18 +624,11 @@ export default function App() {
           const r = await invoke<MsgPage>("read_chat_page", { provider: sel.provider, path: sel.path, before: null, limit: 2000 });
           if (selRef.current?.path !== sel.path || selRef.current?.provider !== sel.provider) return;
           if (r.total < cur.total || r.start > cur.total) { setPage(r); return; }
-          const updates = new Map(r.messages.filter(m => m.id).map(m => [m.id!, m]));
           setPage(p => {
             if (!p || p.total !== cur.total) return p;
-            let changed = false;
-            const messages = p.messages.map(m => {
-              const next = m.id ? updates.get(m.id) : undefined;
-              if (!next || JSON.stringify(next) === JSON.stringify(m)) return m;
-              changed = true;
-              return next;
-            });
-            const added = r.messages.slice(Math.max(0, cur.total - r.start));
-            return changed || added.length ? { ...p, messages: [...messages, ...added], total: r.total } : p;
+            // Native pagination counts stored items, even when an item renders several chat parts.
+            const prefix = p.messages.filter(m => m.sourceIndex !== undefined && m.sourceIndex < r.start);
+            return { ...r, messages: [...prefix, ...r.messages], start: Math.min(p.start, r.start) };
           });
           return;
         }
@@ -1133,7 +1117,7 @@ export default function App() {
 
         {/* Content */}
         <div className="flex min-w-0 flex-1 flex-col">
-        <TitleBar title={selected ? `${PROVIDER_NAME[selected.provider]} / ${prettyProject(selected.project)}` : undefined} actions={selected ? searchButton : undefined} sidebarOpen={sidebarOpen} busy={!!indexing} dark={dark} onRefresh={rescan} onTheme={() => setDark((d) => !d)} />
+        <TitleBar title={selected ? `${PROVIDER_NAME[selected.provider]} / ${prettyProject(selected.project)}` : undefined} actions={selected ? searchButton : undefined} sidebarOpen={sidebarOpen} busy={!!indexing} dark={dark} onRefresh={rescan} onTheme={() => setDark((d) => !d)} onDriveSettings={() => { setSyncTab("drive"); setSyncOpen(true); }} />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <Suspense fallback={<MessagesSkeleton />}>
           {searchAll ? (
@@ -1243,6 +1227,7 @@ export default function App() {
                 setSyncOpen(true);
               }}
               onDone={() => {
+                invalidateBackups({ clear: true });
                 setMovePending(null);
                 setSyncOpen(true);
                 void rescan();

@@ -1,6 +1,6 @@
 [package]
 name = "chatvault"
-version = "0.5.1"
+version = "0.6.1"
 description = "Browse and read every Claude Code chat stored on this PC"
 authors = ["Sanaullah Rais"]
 edition = "2024"

@@ -75,6 +75,31 @@ mod media_tests {
         assert!(!claude_keeps(&p("proj/notes.txt"), false));
         assert!(!claude_keeps(&p("proj/chat/other/file.png"), false));
     }
+
+    #[test]
+    fn restore_copies_missing_files_and_preserves_existing_ones() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!(
+            "chatvault-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let backup = root.join("backup.jsonl");
+        let tool = root.join("tool.jsonl");
+        fs::write(&backup, b"backed-up chat").unwrap();
+        assert_eq!(restore_file(&backup, &tool).unwrap(), 14);
+        assert_eq!(fs::read(&tool).unwrap(), b"backed-up chat");
+        assert!(!needs_copy(&tool, &backup, true), "an unchanged restored file is already backed up");
+
+        fs::write(&tool, b"existing chat").unwrap();
+        assert_eq!(restore_file(&backup, &tool).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&tool).unwrap(), b"existing chat");
+        fs::remove_file(&tool).unwrap();
+        fs::remove_file(&backup).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
 }
 
 /// (source, destination) pairs. `forward` = live -> backup, otherwise backup -> live.
@@ -162,20 +187,37 @@ fn needs_copy(src: &Path, dst: &Path, overwrite_changed: bool) -> bool {
         return false;
     }
     let Ok(sm) = fs::metadata(src) else { return false };
-    if sm.len() != dm.len() {
-        return true;
-    }
     match (sm.modified(), dm.modified()) {
-        (Ok(s), Ok(d)) => s.duration_since(d).map(|x| x.as_secs() > 2).unwrap_or(false),
-        _ => false,
+        (Ok(source), Ok(backup)) => source > backup || (source == backup && sm.len() != dm.len()),
+        _ => sm.len() != dm.len(),
     }
 }
 
-fn run(app: &AppHandle, forward: bool) -> Result<SyncStats, String> {
+pub(crate) fn exclusive<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     if BUSY.swap(true, Ordering::SeqCst) {
-        return Err("A sync is already running".into());
+        return Err("A local backup operation is already running. Try again when it finishes.".into());
     }
-    let result = (|| {
+    let result = job();
+    BUSY.store(false, Ordering::SeqCst);
+    result
+}
+
+fn restore_file(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    let mut source = File::open(src)?;
+    let mut target = File::create_new(dst)?;
+    let result = std::io::copy(&mut source, &mut target).and_then(|bytes| {
+        target.set_modified(source.metadata()?.modified()?)?;
+        Ok(bytes)
+    });
+    if result.is_err() {
+        drop(target);
+        let _ = fs::remove_file(dst);
+    }
+    result
+}
+
+fn run(app: &AppHandle, forward: bool) -> Result<SyncStats, String> {
+    exclusive(|| {
         let root = backup_root().ok_or("No Documents folder")?;
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let all = pairs(forward);
@@ -192,11 +234,21 @@ fn run(app: &AppHandle, forward: bool) -> Result<SyncStats, String> {
             if let Some(parent) = dst.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            match fs::copy(src, dst) {
+            let result = if forward {
+                fs::copy(src, dst).and_then(|bytes| {
+                    let mtime = fs::metadata(src)?.modified()?;
+                    fs::OpenOptions::new().write(true).open(dst)?.set_modified(mtime)?;
+                    Ok(bytes)
+                })
+            } else {
+                restore_file(src, dst)
+            };
+            match result {
                 Ok(n) => {
                     stats.copied += 1;
                     stats.bytes += n;
                 }
+                Err(e) if !forward && e.kind() == std::io::ErrorKind::AlreadyExists => stats.skipped += 1,
                 Err(_) => stats.failed += 1,
             }
             if i % 10 == 0 {
@@ -213,7 +265,7 @@ fn run(app: &AppHandle, forward: bool) -> Result<SyncStats, String> {
         }
         merge_codex_index(forward);
         // A backup stopped halfway is not a finished one: "last synced" keeps the time of the last complete backup.
-        if forward && !stopped {
+        if forward && !stopped && stats.failed == 0 {
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -225,9 +277,7 @@ fn run(app: &AppHandle, forward: bool) -> Result<SyncStats, String> {
             Progress { phase: "Done".into(), done: todo.len(), total: todo.len(), current: String::new() },
         );
         Ok(stats)
-    })();
-    BUSY.store(false, Ordering::SeqCst);
-    result
+    })
 }
 
 /// session_index.jsonl holds Codex thread names. Add any thread the destination does not have yet.
@@ -278,11 +328,6 @@ pub fn backup(app: &AppHandle) -> Result<SyncStats, String> {
 
 pub fn restore(app: &AppHandle) -> Result<SyncStats, String> {
     run(app, false)
-}
-
-/// How many files "Restore missing" would copy back into the tools now (files in the backup the tools do not have).
-pub fn restore_preview() -> usize {
-    pairs(false).iter().filter(|(s, d)| needs_copy(s, d, false)).count()
 }
 
 pub fn status() -> BackupStatus {

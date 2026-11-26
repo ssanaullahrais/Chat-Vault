@@ -77,12 +77,13 @@ export type Chat = {
   userArchived?: boolean;
 };
 export type Msg = {
+  sourceIndex?: number;
   /** "system" is a note from the AI app itself (see the "notice" kind). */
   role: "user" | "assistant" | "system";
   ts: string;
   text: string;
   /** "notice": a note the AI app shows in the conversation (command output, compaction, an error, an unknown entry). */
-  kind: "text" | "tool" | "summary" | "image" | "result" | "reasoning" | "notice";
+  kind: "text" | "tool" | "summary" | "image" | "attachment" | "result" | "reasoning" | "notice";
   id?: string;
   name?: string;
   data?: Record<string, unknown> | string;
@@ -151,7 +152,7 @@ const fileStamp = () => {
 };
 
 /** Asks where to save with the system Save dialog, then writes the file there. Returns false if the user cancels. */
-async function saveWithDialog(name: string, content: string, toast: (m: string) => void, format: { ext: string; label: string } = { ext: "md", label: "Markdown" }) {
+export async function saveWithDialog(name: string, content: string, toast: (m: string) => void, format: { ext: string; label: string } = { ext: "md", label: "Markdown" }) {
   const safe = name.replace(/[\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim().slice(0, 80) || "chat";
   const path = await save({ defaultPath: `${safe}-${fileStamp()}.${format.ext}`, filters: [{ name: format.label, extensions: [format.ext] }] });
   if (!path) return false;

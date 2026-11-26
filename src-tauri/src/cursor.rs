@@ -246,6 +246,46 @@ fn user_query(text: &str) -> String {
     text.trim().to_string()
 }
 
+fn cursor_ide_parts(bubble: &Value, role: &str, ts: &str, out: &mut Vec<Msg>) {
+    use crate::providers::{attachment_message, image_message, local_attachment_path};
+    let images = bubble.get("images").and_then(Value::as_array).filter(|images| !images.is_empty())
+        .or_else(|| bubble.pointer("/context/selectedImages").and_then(Value::as_array));
+    for item in images.into_iter().flatten() {
+        let source = item.as_str().or_else(|| item.get("dataUrl").and_then(Value::as_str));
+        out.push(attachment_message(role, ts, item)
+            .unwrap_or_else(|| image_message(role, ts, None, source)));
+    }
+    for file in bubble.pointer("/context/fileSelections").and_then(Value::as_array).into_iter().flatten() {
+        let path = file.pointer("/uri/_fsPath").or_else(|| file.pointer("/uri/path")).and_then(Value::as_str);
+        if let Some(name) = path.and_then(|p| Path::new(p).file_name()).and_then(|n| n.to_str()) {
+            let mut msg = Msg::new(role, ts, name.to_owned(), "attachment");
+            msg.data = path.and_then(local_attachment_path).map(|path| serde_json::json!({ "path": path }));
+            out.push(msg);
+        }
+    }
+    let Some(tool) = bubble.get("toolFormerData") else { return };
+    let Some(name) = tool.get("name").and_then(Value::as_str) else { return };
+    let mut message = Msg::new("assistant", ts, format!("{name}:"), "tool");
+    message.name = Some(name.to_owned());
+    message.id = tool.get("toolCallId").and_then(Value::as_str).map(String::from);
+    let params = tool.get("params").or_else(|| tool.get("rawArgs"));
+    message.data = params.map(|p| {
+        p.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| p.clone())
+    });
+    let input = message.data.clone();
+    crate::providers::annotate(&mut message, input.as_ref());
+    message.error = Some(matches!(tool.get("status").and_then(Value::as_str), Some("error" | "failed")));
+    if let Some(output) = tool.get("result").filter(|v| !v.is_null()) {
+        let text = output.as_str().map(String::from)
+            .or_else(|| output.get("output").or_else(|| output.get("text")).and_then(Value::as_str).map(String::from))
+            .unwrap_or_else(|| output.to_string());
+        let mut result = Msg::new("assistant", ts, clip(&text, 8000), "result");
+        result.error = message.error;
+        message.result = Some(Box::new(result));
+    }
+    out.push(message);
+}
+
 fn cli_messages(path: &Path) -> Vec<Msg> {
     let mut out = Vec::new();
     let Some(c) = open_ro(path) else { return out };
@@ -271,6 +311,14 @@ fn cli_messages(path: &Path) -> Vec<Msg> {
                 }
             }
             _ => {}
+        }
+        if let Some(parts) = content.as_array() {
+            let blocks: Vec<_> = parts.iter().filter(|part| part.get("type").and_then(Value::as_str) != Some("text")).cloned().collect();
+            if !blocks.is_empty() && matches!(role, "user" | "assistant") {
+                out.extend(crate::providers::claude_messages(&serde_json::json!({
+                    "type": role, "timestamp": iso, "message": {"role": role, "content": blocks}
+                })));
+            }
         }
     }
     out
@@ -388,11 +436,7 @@ pub fn read(path: &str) -> Result<Vec<Msg>, String> {
             if !text.trim().is_empty() {
                 out.push(Msg::new(role, &ts, text, "text"));
             }
-            if let Some(tool) = b.get("toolFormerData").and_then(|t| t.get("name")).and_then(|n| n.as_str()) {
-                let mut m = Msg::new("assistant", &ts, format!("{}:", tool), "tool");
-                m.name = Some(tool.to_string());
-                out.push(m);
-            }
+            cursor_ide_parts(&b, role, &ts, &mut out);
         }
         return Ok(out);
     }

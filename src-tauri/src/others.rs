@@ -4,7 +4,7 @@
 //! - Cline: `~/.cline/data/sessions/<id>/<id>.messages.json` with a `<id>.json` summary beside it
 
 use crate::paths::*;
-use crate::providers::{clip, Msg};
+use crate::providers::{attachment_message, clip, Msg};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::fs;
@@ -62,7 +62,7 @@ fn gemini_files() -> Vec<PathBuf> {
         if let Ok(files) = fs::read_dir(&chats) {
             for f in files.flatten() {
                 let p = f.path();
-                if p.extension().map(|e| e == "json").unwrap_or(false) {
+                if p.extension().is_some_and(|e| e == "json" || e == "jsonl") {
                     out.push(p);
                 }
             }
@@ -93,8 +93,30 @@ fn gemini_project(p: &Path) -> Option<String> {
     fs::read_to_string(root).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-fn gemini_messages(p: &Path) -> Vec<Msg> {
-    let Some(j) = read_json(p) else { return Vec::new() };
+fn gemini_session(path: &Path) -> Option<Value> {
+    if path.extension().is_none_or(|e| e != "jsonl") {
+        return read_json(path);
+    }
+    let mut session = serde_json::Map::new();
+    let mut messages = Vec::new();
+    for line in open_lines(path)? {
+        let Ok(mut entry) = serde_json::from_str::<Value>(&line) else { continue };
+        if let Some(patch) = entry.get_mut("$set").and_then(Value::as_object_mut) {
+            if let Some(Value::Array(updated)) = patch.remove("messages") {
+                messages = updated;
+            }
+            session.extend(std::mem::take(patch));
+        } else if entry.get("type").is_some() {
+            messages.push(entry);
+        } else if let Value::Object(fields) = entry {
+            session.extend(fields);
+        }
+    }
+    session.insert("messages".into(), Value::Array(messages));
+    Some(Value::Object(session))
+}
+
+fn gemini_messages(j: &Value) -> Vec<Msg> {
     let mut out = Vec::new();
     for m in j.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default() {
         let ts = m.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string();
@@ -103,6 +125,14 @@ fn gemini_messages(p: &Path) -> Vec<Msg> {
                 let t = gemini_user_text(&m);
                 if !t.trim().is_empty() {
                     out.push(Msg::new("user", &ts, t, "text"));
+                }
+                let media: Vec<_> = m.get("content").and_then(Value::as_array).into_iter().flatten()
+                    .filter_map(|part| attachment_message("user", &ts, part)).collect();
+                if media.is_empty() {
+                    out.extend(m.get("displayContent").and_then(Value::as_array).into_iter().flatten()
+                        .filter_map(|part| attachment_message("user", &ts, part)));
+                } else {
+                    out.extend(media);
                 }
             }
             "gemini" => {
@@ -115,23 +145,34 @@ fn gemini_messages(p: &Path) -> Vec<Msg> {
                         out.push(Msg::new("assistant", &ts, clip(&text.join("\n"), 6000), "reasoning"));
                     }
                 }
-                let t = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if !t.trim().is_empty() {
-                    out.push(Msg::new("assistant", &ts, t.to_string(), "text"));
+                if let Some(t) = m.get("content").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+                    out.push(Msg::new("assistant", &ts, t.to_owned(), "text"));
                 }
-                for call in m.get("toolCalls").and_then(|c| c.as_array()).cloned().unwrap_or_default() {
+                for part in m.get("content").and_then(Value::as_array).into_iter().flatten() {
+                    if let Some(t) = part.get("text").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+                        out.push(Msg::new("assistant", &ts, t.to_owned(), "text"));
+                    } else if let Some(media) = attachment_message("assistant", &ts, part) {
+                        out.push(media);
+                    }
+                }
+                for (i, call) in m.get("toolCalls").and_then(Value::as_array).into_iter().flatten().enumerate() {
                     let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-                    let id = call.get("id").and_then(|n| n.as_str()).map(String::from);
+                    let id = Some(call.get("id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| format!("gemini-{}-{i}", out.len())));
                     let mut tool = Msg::new("assistant", &ts, format!("{}:", name), "tool");
                     tool.name = Some(name);
                     tool.id = id.clone();
+                    tool.error = Some(matches!(call.get("status").and_then(Value::as_str), Some("error" | "failed")));
                     tool.data = call.get("args").cloned(); { let inp = tool.data.clone(); crate::providers::annotate(&mut tool, inp.as_ref()); }
                     out.push(tool);
-                    let result = call.get("resultDisplay").and_then(|r| r.as_str()).map(String::from).or_else(|| call.get("result").map(|r| clip(&r.to_string(), 4000)));
+                    let result = call.get("resultDisplay").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(String::from)
+                        .or_else(|| call.get("result").map(gemini_tool_text));
                     if let Some(r) = result.filter(|r| !r.trim().is_empty()) {
                         let mut res = Msg::new("assistant", &ts, clip(&r, 8000), "result");
                         res.id = id;
                         out.push(res);
+                    }
+                    for part in call.get("result").and_then(Value::as_array).into_iter().flatten() {
+                        if let Some(media) = attachment_message("assistant", &ts, part) { out.push(media); }
                     }
                 }
             }
@@ -153,10 +194,27 @@ fn gemini_messages(p: &Path) -> Vec<Msg> {
     out
 }
 
+fn gemini_tool_text(result: &Value) -> String {
+    match result {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts.iter().map(gemini_tool_text).filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n"),
+        Value::Object(_) if attachment_message("assistant", "", result).is_some() => String::new(),
+        Value::Object(_) => {
+            if let Some(value) = result.get("text").or_else(|| result.pointer("/functionResponse/response")).or_else(|| result.get("output")) {
+                gemini_tool_text(value)
+            } else {
+                result.to_string()
+            }
+        }
+        Value::Null => String::new(),
+        value => value.to_string(),
+    }
+}
+
 fn scan_gemini(out: &mut Vec<OtherChat>) {
     for p in gemini_files() {
-        let Some(j) = read_json(&p) else { continue };
-        let msgs = gemini_messages(&p);
+        let Some(j) = gemini_session(&p) else { continue };
+        let msgs = gemini_messages(&j);
         let Some(first) = msgs.iter().find(|m| m.role == "user") else { continue };
         let first_line = first.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("Chat").trim();
         let id = j.get("sessionId").and_then(|s| s.as_str()).map(String::from).unwrap_or_else(|| p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
@@ -297,6 +355,11 @@ fn opencode_v2_tool_output(state: &Value) -> Option<String> {
         }
     }
     if text.trim().is_empty() {
+        if let Some(output) = state.get("output").and_then(Value::as_str) {
+            text = output.to_owned();
+        }
+    }
+    if text.trim().is_empty() {
         if let Some(e) = state.get("error") {
             text = e.get("message").and_then(|m| m.as_str()).map(String::from).unwrap_or_else(|| e.to_string());
         }
@@ -324,6 +387,20 @@ fn opencode_v2_messages(c: &Connection, id: &str) -> Option<Vec<Msg>> {
                 let t = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 if !t.trim().is_empty() {
                     out.push(Msg::new("user", &ts, t.to_string(), "text"));
+                }
+                let parts: Vec<Value> = part_st.as_mut()
+                    .and_then(|ps| ps.query_map([&mid], |r| r.get::<_, String>(0)).ok()
+                        .map(|rows| rows.flatten().filter_map(|raw| serde_json::from_str(&raw).ok()).collect()))
+                    .filter(|parts: &Vec<Value>| !parts.is_empty())
+                    .or_else(|| v.get("content").and_then(Value::as_array).cloned()).unwrap_or_default();
+                for part in &parts {
+                    if let Some(media) = attachment_message("user", &ts, part) {
+                        out.push(media);
+                    } else if t.trim().is_empty() {
+                        if let Some(text) = part.get("text").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                            out.push(Msg::new("user", &ts, text.to_owned(), "text"));
+                        }
+                    }
                 }
             }
             "shell" => {
@@ -358,6 +435,10 @@ fn opencode_v2_messages(c: &Connection, id: &str) -> Option<Vec<Msg>> {
                     parts = v.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
                 }
                 for p in parts {
+                    if let Some(media) = attachment_message("assistant", &ts, &p) {
+                        out.push(media);
+                        continue;
+                    }
                     match p.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                         "text" => {
                             let t = p.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -378,12 +459,17 @@ fn opencode_v2_messages(c: &Connection, id: &str) -> Option<Vec<Msg>> {
                             tool.name = Some(name);
                             tool.id = cid.clone();
                             let state = p.get("state").cloned().unwrap_or(Value::Null);
+                            tool.error = Some(matches!(state.get("status").and_then(Value::as_str), Some("error" | "failed")));
                             tool.data = state.get("input").cloned(); { let inp = tool.data.clone(); crate::providers::annotate(&mut tool, inp.as_ref()); }
                             out.push(tool);
                             if let Some(o) = opencode_v2_tool_output(&state) {
                                 let mut res = Msg::new("assistant", &ts, clip(&o, 8000), "result");
                                 res.id = cid;
                                 out.push(res);
+                            }
+                            for key in ["content", "attachments"] {
+                                out.extend(state.get(key).and_then(Value::as_array).into_iter().flatten()
+                                    .filter_map(|part| attachment_message("assistant", &ts, part)));
                             }
                         }
                         _ => {}
@@ -460,9 +546,8 @@ fn opencode_messages(key: &str) -> Vec<Msg> {
                         out.push(res);
                     }
                 }
-                "file" => {
-                    let name = p.get("filename").or(p.get("url")).and_then(|x| x.as_str()).unwrap_or("a file");
-                    out.push(crate::providers::notice(&ts, "attachment", &format!("Attached {name}"), false));
+                "file" | "image" => {
+                    if let Some(media) = attachment_message(role, &ts, &p) { out.push(media); }
                 }
                 "compaction" => out.push(crate::providers::notice(&ts, "compact", "Conversation compacted", false)),
                 // OpenCode's own bookkeeping, not shown in its app either.
@@ -570,6 +655,10 @@ fn cline_messages(p: &Path) -> Vec<Msg> {
         let role = if m.get("role").and_then(|r| r.as_str()) == Some("user") { "user" } else { "assistant" };
         let ts = m.get("ts").and_then(|t| t.as_str().map(String::from).or_else(|| t.as_i64().map(|n| n.to_string()))).and_then(|s| s.parse::<i64>().ok()).and_then(chrono::DateTime::from_timestamp_millis).map(|d| d.to_rfc3339()).unwrap_or_default();
         for b in blocks(m.get("content").unwrap_or(&Value::Null)) {
+            if let Some(media) = attachment_message(role, &ts, &b) {
+                out.push(media);
+                continue;
+            }
             match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "text" => {
                     let t = clean_cline_text(b.get("text").and_then(|t| t.as_str()).unwrap_or(""));
@@ -601,8 +690,10 @@ fn cline_messages(p: &Path) -> Vec<Msg> {
                     if !text.trim().is_empty() {
                         let mut res = Msg::new("assistant", &ts, clip(&text, 8000), "result");
                         res.id = b.get("tool_use_id").and_then(|n| n.as_str()).map(String::from);
+                        res.error = b.get("is_error").and_then(Value::as_bool);
                         out.push(res);
                     }
+                    out.extend(raw.as_array().into_iter().flatten().filter_map(|part| attachment_message("assistant", &ts, part)));
                 }
                 _ => {}
             }
@@ -664,7 +755,7 @@ pub fn fingerprint() -> i64 {
 
 pub fn read(path: &str) -> Result<Vec<Msg>, String> {
     if let Some(p) = path.strip_prefix("gemini:") {
-        return Ok(gemini_messages(Path::new(p)));
+        return Ok(gemini_session(Path::new(p)).as_ref().map(gemini_messages).unwrap_or_default());
     }
     if let Some(id) = path.strip_prefix("opencode:") {
         return Ok(opencode_messages(id));

@@ -87,7 +87,7 @@ pub(crate) fn relevant(provider: &str, line: &str) -> bool {
 }
 
 fn clip_msg(mut m: Msg, max: usize) -> Msg {
-    if m.text.chars().count() > max {
+    if (m.role != "user" || m.kind != "text") && m.text.chars().count() > max {
         m.text = clip(&m.text, max);
     }
     m
@@ -1407,12 +1407,12 @@ fn account_info() -> Vec<AccountInfo> {
 
 #[tauri::command]
 async fn sync_chats(app: AppHandle) -> Result<sync::SyncStats, String> {
-    tauri::async_runtime::spawn_blocking(move || sync::backup(&app)).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || gdrive::exclusive(|| sync::backup(&app))).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 async fn restore_chats(app: AppHandle) -> Result<sync::SyncStats, String> {
-    tauri::async_runtime::spawn_blocking(move || sync::restore(&app)).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || gdrive::exclusive(|| sync::restore(&app))).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1458,7 +1458,7 @@ async fn check_backup_location(path: String) -> Result<backuploc::Check, String>
 
 #[tauri::command]
 async fn set_backup_location(app: AppHandle, path: String, move_files: bool) -> Result<backuploc::MoveResult, String> {
-    tauri::async_runtime::spawn_blocking(move || backuploc::set(&app, &path, move_files)).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || gdrive::exclusive(|| backuploc::set(&app, &path, move_files))).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1494,18 +1494,98 @@ async fn gdrive_disconnect(delete_backup: bool) -> Result<gdrive::Status, String
 }
 
 #[tauri::command]
-async fn gdrive_sync(app: AppHandle, restore: bool) -> Result<gdrive::Stats, String> {
-    tauri::async_runtime::spawn_blocking(move || gdrive::sync(&app, restore)).await.map_err(|e| e.to_string())?
+async fn gdrive_sync(app: AppHandle, restore: bool, scope: Option<String>) -> Result<gdrive::Stats, String> {
+    tauri::async_runtime::spawn_blocking(move || gdrive::sync(&app, restore, scope.as_deref())).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn backup_entries(drive: bool) -> Result<Vec<backups::Entry>, String> {
-    tauri::async_runtime::spawn_blocking(move || backups::entries(drive)).await.map_err(|e| e.to_string())?
+async fn backup_entries(
+    drive: bool, refresh: Option<bool>, stream: bool, scope: String,
+    preview: tauri::ipc::Channel<Vec<backups::Entry>>,
+) -> Result<Vec<backups::Entry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if gdrive::backup_scope().0 != scope {
+            return Err("The backup source changed. Refresh the list to continue.".into());
+        }
+        if drive && refresh.unwrap_or(false) {
+            gdrive::refresh_listing();
+        }
+        let rows = backups::entries(drive, stream.then_some(move |rows| { let _ = preview.send(rows); }))?;
+        if gdrive::backup_scope().0 != scope {
+            return Err("The backup source changed. Refresh the list to continue.".into());
+        }
+        Ok(rows)
+    }).await.map_err(|e| e.to_string())?
+}
+
+type BackupDeleteJob = (String, std::sync::Arc<std::sync::atomic::AtomicBool>);
+static BACKUP_JOBS: std::sync::Mutex<Vec<BackupDeleteJob>> = std::sync::Mutex::new(Vec::new());
+
+#[tauri::command]
+async fn backup_delete(
+    app: AppHandle,
+    units: Vec<backups::UnitRef>,
+    local: bool,
+    drive: bool,
+    job_id: Option<String>,
+    retry_ids: Option<Vec<String>>,
+    scope: Option<String>,
+) -> Result<gdrive::Removed, String> {
+    use tauri::Emitter;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(id) = &job_id {
+        register_backup_job(id, &stop)?;
+    }
+    let retry = retry_ids.map(|ids| ids.into_iter().collect());
+    let progress_id = job_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let report = |done: usize, total: usize| {
+            if let Some(id) = &progress_id {
+                let _ = app.emit("backup-delete-progress", serde_json::json!({ "id": id, "done": done, "total": total }));
+            }
+        };
+        report(0, 0);
+        backups::delete(&units, local, drive, &stop, retry.as_ref(), scope.as_deref(), report)
+    }).await;
+    if let Some(id) = &job_id { unregister_backup_job(id); }
+    result.map_err(|e| e.to_string())?
+}
+
+fn register_backup_job(id: &str, stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    let mut active = BACKUP_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    if active.iter().any(|(current, _)| current == id) {
+        return Err("This backup job is already running.".into());
+    }
+    active.push((id.to_owned(), stop.clone()));
+    Ok(())
+}
+
+fn unregister_backup_job(id: &str) {
+    BACKUP_JOBS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(current, _)| current != id);
 }
 
 #[tauri::command]
-async fn backup_delete(units: Vec<backups::UnitRef>, local: bool, drive: bool) -> Result<gdrive::Removed, String> {
-    tauri::async_runtime::spawn_blocking(move || backups::delete(&units, local, drive)).await.map_err(|e| e.to_string())?
+fn stop_backup_delete(job_id: String) {
+    let active = BACKUP_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, stop)) = active.iter().find(|(id, _)| *id == job_id) {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tauri::command]
+async fn backup_upload(app: AppHandle, units: Vec<backups::UnitRef>, job_id: String, scope: String) -> Result<gdrive::Stats, String> {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    register_backup_job(&job_id, &stop)?;
+    let id = job_id.clone();
+    let units = units.into_iter().map(|u| (u.provider, u.key)).collect();
+    let result = tauri::async_runtime::spawn_blocking(move || gdrive::selected_upload(&app, &units, &id, &stop, &scope)).await;
+    unregister_backup_job(&job_id);
+    result.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn backup_scope() -> Result<(String, bool), String> {
+    tauri::async_runtime::spawn_blocking(gdrive::backup_scope).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1520,33 +1600,6 @@ async fn gdrive_check() -> Result<gdrive::Status, String> {
     tauri::async_runtime::spawn_blocking(gdrive::check).await.map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn backup_sets(drive: bool) -> Result<Vec<backups::BackupSet>, String> {
-    tauri::async_runtime::spawn_blocking(move || backups::sets(drive)).await.map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn backup_delete_local_all() -> Result<gdrive::Removed, String> {
-    tauri::async_runtime::spawn_blocking(backups::delete_local_all).await.map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn gdrive_delete_device(device: String) -> Result<usize, String> {
-    tauri::async_runtime::spawn_blocking(move || gdrive::delete_device(&device)).await.map_err(|e| e.to_string())?
-}
-
-/// Downloads one PC's whole Drive backup into this PC's backup folder (a file changed on both sides keeps both copies).
-#[tauri::command]
-async fn gdrive_download_device(app: AppHandle, device: String) -> Result<gdrive::Stats, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let units = backups::device_units(&device)?;
-        gdrive::transfer(&app, &units, false)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// Cancels the running Google Drive sync. What it already uploaded stays, and the next sync carries on from there.
 #[tauri::command]
 fn gdrive_cancel_sync() {
     gdrive::cancel_sync();
@@ -1733,12 +1786,11 @@ pub fn run() {
             gdrive_cancel_sync,
             backup_entries,
             backup_delete,
+            stop_backup_delete,
             backup_transfer,
-            backup_sets,
+            backup_upload,
+            backup_scope,
             gdrive_check,
-            backup_delete_local_all,
-            gdrive_delete_device,
-            gdrive_download_device,
             chat_sources,
             open_chat_source,
             backup_location_info,
@@ -1758,6 +1810,15 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn keeps_full_user_text_for_pasted_attachments() {
+        let text = format!("{}\nEnd of paste\n", "日".repeat(31_000));
+        let input = Msg::new("user", "", text.clone(), "text");
+        let reply = Msg::new("assistant", "", text.clone(), "text");
+        assert_eq!(clip_msg(input, 30_000).text, text);
+        assert_eq!(clip_msg(reply, 30_000).text, clip(&text, 30_000));
+    }
 
     #[test]
     fn indexes_and_reads_real_chats() {

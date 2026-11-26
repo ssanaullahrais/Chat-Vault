@@ -48,8 +48,65 @@ const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 const ALLOWED_ROOTS: [&str; 6] = ["claude", "codex", "cursor", "gemini", "cline", "opencode"];
 
 static BUSY: AtomicBool = AtomicBool::new(false);
+type Unit = (String, String);
+static ACTIVE_UNITS: Mutex<Vec<HashSet<Unit>>> = Mutex::new(Vec::new());
+
+struct DriveGuard(Option<HashSet<Unit>>);
+
+impl Drop for DriveGuard {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_UNITS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(units) = &self.0 {
+            active.retain(|job| job != units);
+        } else {
+            CANCEL_SYNC.store(false, Ordering::SeqCst);
+            BUSY.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn drive_guard(units: Option<&HashSet<Unit>>) -> Result<DriveGuard, String> {
+    let mut active = ACTIVE_UNITS.lock().unwrap_or_else(|e| e.into_inner());
+    if BUSY.load(Ordering::SeqCst)
+        || units.map_or(!active.is_empty(), |units| active.len() >= 2 || active.iter().any(|job| !job.is_disjoint(units)))
+    {
+        return Err("A backup job is using these files. Try again when it finishes.".into());
+    }
+    if let Some(units) = units {
+        active.push(units.clone());
+    } else {
+        BUSY.store(true, Ordering::SeqCst);
+    }
+    Ok(DriveGuard(units.cloned()))
+}
+
+fn drive_busy() -> bool {
+    let active = ACTIVE_UNITS.lock().unwrap_or_else(|e| e.into_inner());
+    BUSY.load(Ordering::SeqCst) || !active.is_empty()
+}
+
+pub(crate) fn backup_scope() -> (String, bool) {
+    let state = load();
+    let connected = client().is_some() && state.connected && refresh_token().is_some();
+    let folder = backup_root();
+    let key = json!([folder, if connected { state.email } else { None }]).to_string();
+    (key, connected)
+}
+
+pub(crate) fn validate_scope(expected: &str) -> Result<(), String> {
+    let (key, connected) = backup_scope();
+    if !connected || key != expected {
+        return Err("Reconnect the original Google Drive account and backup folder before resuming.".into());
+    }
+    Ok(())
+}
+
 static CANCEL_SIGN_IN: AtomicBool = AtomicBool::new(false);
 static TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+const LIST_TTL: Duration = Duration::from_secs(120);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
+static LIST_LOCK: Mutex<()> = Mutex::new(());
+static LIST_CACHE: Mutex<Option<(Instant, Vec<Value>)>> = Mutex::new(None);
 static STATE_LOCK: Mutex<()> = Mutex::new(());
 /// Set when the user cancels a running sync.
 static CANCEL_SYNC: AtomicBool = AtomicBool::new(false);
@@ -84,9 +141,6 @@ struct State {
     applied: HashMap<String, String>,
     /// The PCs that sync with this Google account, as last seen.
     devices: Vec<Device>,
-    /// Files whose Drive copy was deleted on purpose from the Backups tab, as they were here (size, modified ms): not
-    /// uploaded again until they change.
-    skip_upload: HashMap<String, (i64, i64)>,
     /// Files whose local copy was deleted on purpose: the Drive version that was there, not downloaded again until
     /// it changes.
     skip_download: HashMap<String, String>,
@@ -120,6 +174,7 @@ pub struct Device {
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Stats {
+    pub backed_up: usize,
     pub uploaded: usize,
     pub downloaded: usize,
     pub conflicts: usize,
@@ -288,7 +343,7 @@ fn access_token() -> Result<String, String> {
     if let Some(s) = secret {
         form.push(("client_secret", s.to_string()));
     }
-    let r = http()?.post(TOKEN_URL).form(&form).send().map_err(|e| net_err(&e))?;
+    let r = hc().post(TOKEN_URL).timeout(METADATA_TIMEOUT).form(&form).send().map_err(|e| net_err(&e))?;
     let status = r.status();
     let v: Value = r.json().unwrap_or(Value::Null);
     if !status.is_success() {
@@ -310,6 +365,7 @@ fn remember_access(v: &Value) -> Result<String, String> {
 }
 
 fn forget_sign_in() {
+    invalidate_listing();
     *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if let Ok(k) = keyring() {
         let _ = k.delete_credential();
@@ -318,6 +374,9 @@ fn forget_sign_in() {
         s.connected = false;
         s.email = None;
         s.name = None;
+        s.last_sync_ms = None;
+        s.last_result = None;
+        s.uploads.clear();
     });
 }
 
@@ -357,11 +416,32 @@ pub(crate) fn parse_callback(request_line: &str, expected_state: &str) -> Callba
 }
 
 fn reply(mut s: TcpStream, status: &str, title: &str, body: &str) {
+    let logo = base64::engine::general_purpose::STANDARD.encode(include_bytes!("../icons/128x128.png"));
     let page = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title>\
-         <style>html{{color-scheme:light dark}}body{{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0a0a0a;color:#e4e4e7}}\
-         main{{max-width:28rem;padding:2rem;text-align:center}}h1{{font-size:1.25rem;font-weight:600}}p{{color:#a1a1aa;line-height:1.5}}</style></head>\
-         <body><main><h1>{title}</h1><p>{body}</p></main></body></html>"
+        r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title} | ChatVault</title>
+  <style>
+    :root {{ color-scheme: light; font: 16px/1.5 "Segoe UI", system-ui, sans-serif; }}
+    body {{ box-sizing: border-box; display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 24px; background: #f7f8fa; color: #18181b; }}
+    main {{ box-sizing: border-box; width: min(100%, 29rem); padding: clamp(24px, 6vw, 40px); background: #fff; border: 1px solid #e4e4e7; border-radius: 20px; box-shadow: 0 12px 32px #18181b0a; }}
+    .brand {{ display: flex; gap: 10px; align-items: center; font-size: .9375rem; font-weight: 600; }}
+    .brand img {{ display: block; width: 36px; height: 36px; }}
+    h1 {{ margin: 24px 0 8px; font-size: clamp(1.5rem, 5vw, 2rem); line-height: 1.18; letter-spacing: -.025em; }}
+    p {{ margin: 0; color: #52525b; }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand"><img src="data:image/png;base64,{logo}" width="36" height="36" alt="">ChatVault</div>
+    <h1>{title}</h1>
+    <p>{body}</p>
+  </main>
+</body>
+</html>"##
     );
     let _ = write!(
         s,
@@ -423,7 +503,7 @@ pub fn status() -> Status {
         last_sync_ms: s.last_sync_ms,
         last_error: s.last_error,
         last_result: s.last_result,
-        busy: BUSY.load(Ordering::SeqCst),
+        busy: drive_busy(),
         run_uploaded: if BUSY.load(Ordering::SeqCst) { RUN_DONE.load(Ordering::SeqCst) } else { 0 },
         cancelling: cancel_requested(),
         devices: if connected { s.devices } else { Vec::new() },
@@ -435,8 +515,6 @@ pub fn status() -> Status {
 pub fn check() -> Status {
     let s = load();
     if client().is_some() && s.connected && refresh_token().is_some() && !BUSY.load(Ordering::SeqCst) {
-        // A fresh token proves the access was not revoked (a cached one can outlive a revoke for a short while).
-        *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let ok = send(|_| hc().get(FILES_URL).query(&[("spaces", "appDataFolder"), ("pageSize", "1"), ("fields", "files(id)")]));
         if ok.is_ok() {
             update(|s| {
@@ -482,6 +560,7 @@ pub fn cancel_sign_in() {
 /// Opens Google's sign-in page in the browser and waits for the answer on 127.0.0.1. Only `drive.appdata` is asked for.
 pub fn connect(app: &AppHandle) -> Result<Status, String> {
     use tauri_plugin_opener::OpenerExt;
+    let _guard = drive_guard(None)?;
     let (id, secret) = client().ok_or("Google Drive is not available in this build of ChatVault.")?;
     CANCEL_SIGN_IN.store(false, Ordering::SeqCst);
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| "Could not get ready for the Google sign-in on this PC.")?;
@@ -517,7 +596,7 @@ pub fn connect(app: &AppHandle) -> Result<Status, String> {
                 let line = read_request_line(&mut stream).unwrap_or_default();
                 match parse_callback(&line, &state) {
                     Callback::Code(c) => {
-                        reply(stream, "200 OK", "ChatVault is connected", "You can close this tab and go back to ChatVault.");
+                        reply(stream, "200 OK", "Google sign-in complete", "You can close this tab and return to ChatVault to finish connecting Google Drive.");
                         break c;
                     }
                     Callback::Denied(_) => {
@@ -566,15 +645,14 @@ pub fn connect(app: &AppHandle) -> Result<Status, String> {
         s.name = about["user"]["displayName"].as_str().map(String::from);
         s.last_error = None;
     });
+    invalidate_listing();
     Ok(status())
 }
 
 /// Signs ChatVault out of Google Drive: the access is revoked at Google and the saved sign-in removed from this PC.
 /// With `delete_backup`, every ChatVault file in the Drive app folder (from every PC) is deleted first.
 pub fn disconnect(delete_backup: bool) -> Result<Status, String> {
-    if BUSY.load(Ordering::SeqCst) {
-        return Err("Wait for the Google Drive sync to finish first.".into());
-    }
+    let _guard = drive_guard(None)?;
     if delete_backup {
         let files = list_remote()?;
         for f in files {
@@ -621,7 +699,48 @@ impl Remote {
     }
 }
 
+fn invalidate_listing() {
+    *LIST_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn cached_listing() -> Option<Vec<Value>> {
+    LIST_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        .filter(|(checked, _)| checked.elapsed() < LIST_TTL)
+        .map(|(_, all)| all.clone())
+}
+
 fn list_all() -> Result<Vec<Value>, String> {
+    let _refresh = LIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(all) = cached_listing() {
+        return Ok(all);
+    }
+    let all = fetch_listing()?;
+    *LIST_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), all.clone()));
+    Ok(all)
+}
+
+pub(crate) fn refresh_listing() {
+    let _refresh = LIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    invalidate_listing();
+}
+
+// Metadata actions should fail promptly so the UI can report the failure and let the user retry.
+fn metadata_request(allow_missing: bool, build: impl Fn() -> reqwest::blocking::RequestBuilder) -> Result<reqwest::blocking::Response, String> {
+    for attempt in 0..2 {
+        let token = access_token()?;
+        let response = build().timeout(METADATA_TIMEOUT).bearer_auth(token).send().map_err(|e| net_err(&e))?;
+        if response.status().as_u16() == 401 && attempt == 0 {
+            *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        } else if response.status().is_success() || (allow_missing && response.status().as_u16() == 404) {
+            return Ok(response);
+        } else {
+            return Err(drive_err(response));
+        }
+    }
+    Err("Google Drive authorization expired. Try again.".into())
+}
+
+fn fetch_listing() -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     let mut page: Option<String> = None;
     loop {
@@ -629,7 +748,7 @@ fn list_all() -> Result<Vec<Value>, String> {
             return Err("cancelled".into());
         }
         let p = page.clone();
-        let r: Value = send(move |_| {
+        let r: Value = metadata_request(false, move || {
             let mut q = vec![
                 ("spaces", "appDataFolder".to_string()),
                 ("pageSize", "1000".to_string()),
@@ -642,9 +761,8 @@ fn list_all() -> Result<Vec<Value>, String> {
         })?
         .json()
         .map_err(|_| "Google Drive did not answer as expected.")?;
-        if let Some(files) = r["files"].as_array() {
-            out.extend(files.iter().cloned());
-        }
+        let files = r["files"].as_array().ok_or("Google Drive did not return its backup list.")?;
+        out.extend(files.iter().cloned());
         match r["nextPageToken"].as_str() {
             Some(t) => page = Some(t.to_string()),
             None => break,
@@ -704,33 +822,71 @@ pub(crate) fn safe_rel(rel: &str) -> Option<PathBuf> {
     Some(p)
 }
 
-pub(crate) fn local_files(root: &Path) -> Vec<(String, PathBuf, i64, i64)> {
-    let mut files = Vec::new();
-    crate::sync::walk_all(root, &mut files);
-    files
-        .into_iter()
-        .filter_map(|f| {
-            let rel = f.strip_prefix(root).ok()?.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
-            let name = f.file_name()?.to_string_lossy().to_string();
-            if name.starts_with(".chatvault") || name.ends_with(".cvpart") || safe_rel(&rel).is_none() {
-                return None;
+type LocalFile = (String, PathBuf, i64, i64);
+
+pub(crate) fn visit_local_files(root: &Path, mut visit: impl FnMut(LocalFile)) {
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+                continue;
             }
-            let m = fs::metadata(&f).ok()?;
-            let mtime = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64;
-            Some((rel, f, m.len() as i64, mtime))
-        })
-        .collect()
+            let Ok(rel) = path.strip_prefix(root) else { continue };
+            let rel = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !kind.is_file() || name.starts_with(".chatvault") || name.ends_with(".cvpart") || safe_rel(&rel).is_none() {
+                continue;
+            }
+            let Ok(m) = entry.metadata() else { continue };
+            let Some(mtime) = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()) else { continue };
+            visit((rel, path, m.len() as i64, mtime.as_millis() as i64));
+        }
+    }
+}
+
+pub(crate) fn local_files(root: &Path) -> Vec<LocalFile> {
+    let mut files = Vec::new();
+    visit_local_files(root, |file| files.push(file));
+    files
+}
+
+fn remote_versions(remote: &[Remote]) -> HashSet<(&str, i64, i64)> {
+    remote.iter().map(|r| (r.rel.as_str(), r.size, r.mtime)).collect()
+}
+
+fn needs_upload(versions: &HashSet<(&str, i64, i64)>, rel: &str, size: i64, mtime: i64) -> bool {
+    !versions.contains(&(rel, size, mtime))
+}
+
+fn upload_compressed(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    ![".zst", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".pdf", ".zip", ".gz", ".mp3", ".mp4", ".mov", ".webm"]
+        .iter().any(|extension| lower.ends_with(extension))
 }
 
 /// Uploads one file. Returns the bytes sent and, when the file was newly created in Drive (not an update of one that
 /// was already there), its Drive id, so a cancelled sync can remove exactly what it created.
+#[cfg(test)]
 fn upload(existing: Option<&str>, rel: &str, device: &str, path: &Path, size: i64, mtime: i64) -> Result<(u64, Option<String>), String> {
+    upload_cancellable(existing, rel, device, path, size, mtime, &cancelled)
+}
+
+fn upload_cancellable(
+    existing: Option<&str>, rel: &str, device: &str, path: &Path, size: i64, mtime: i64,
+    is_stopped: &(dyn Fn() -> bool + Sync),
+) -> Result<(u64, Option<String>), String> {
+    if is_stopped() {
+        return Err("cancelled".into());
+    }
     let raw = fs::read(path).map_err(|_| format!("Could not read {rel}"))?;
     // Already-compressed files (pictures, PDFs, archives, .zst backups) go up as they are; compressing them again
     // only costs time.
-    let lower = rel.to_ascii_lowercase();
-    let packed = [".zst", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".pdf", ".zip", ".gz", ".mp3", ".mp4", ".mov", ".webm"].iter().any(|e| lower.ends_with(e));
-    let zipped = !packed;
+    let zipped = upload_compressed(rel);
     let body = if zipped { zstd::encode_all(&raw[..], 3).map_err(|_| "Could not compress a file.")? } else { raw };
     let props = json!({ "cv": "1", "dev": device, "sz": size.to_string(), "mt": mtime.to_string(), "z": if zipped { "1" } else { "0" } });
     let meta = match existing {
@@ -803,7 +959,7 @@ fn upload(existing: Option<&str>, rel: &str, device: &str, path: &Path, size: i6
     while at < total {
         // Cancelled: stop between two pieces. The pieces already sent stay in Google's hands until the upload address
         // expires; nothing is left in the user's Drive.
-        if cancelled() {
+        if is_stopped() {
             return Err("cancelled".into());
         }
         let end = (at + CHUNK).min(total);
@@ -1022,26 +1178,30 @@ fn progress(app: &AppHandle, phase: &str, done: usize, total: usize, current: &s
 
 /// Uploads this PC's changed backup files, downloads the other PCs' files, and (with `restore`) then copies anything
 /// missing back into the tools. The local backup runs first so the newest chats go up.
-pub fn sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
+pub fn sync(app: &AppHandle, restore: bool, scope: Option<&str>) -> Result<Stats, String> {
     if client().is_none() {
         return Err("Google Drive is not available in this build of ChatVault.".into());
     }
     if refresh_token().is_none() {
         return Err("Google Drive is not connected.".into());
     }
-    if BUSY.swap(true, Ordering::SeqCst) {
-        return Err("A Google Drive sync is already running.".into());
+    let guard = drive_guard(None)?;
+    if let Some(scope) = scope {
+        validate_scope(scope)?;
     }
     begin_run();
     let result = run_sync(app, restore);
     CANCEL_SYNC.store(false, Ordering::SeqCst);
-    BUSY.store(false, Ordering::SeqCst);
     match &result {
         // A cancelled sync is not a finished one: "last synced" stays as it was.
-        Ok(stats) if stats.cancelled => {
-            update(|s| s.last_error = None);
+        Ok(stats) if stats.cancelled && !restore => {
+            update(|s| {
+                s.last_error = None;
+                s.last_result = Some(stats.clone());
+            });
         }
-        Ok(stats) => {
+        Ok(stats) if stats.cancelled => {}
+        Ok(stats) if !restore => {
             let st = stats.clone();
             update(|s| {
                 s.last_sync_ms = Some(now_ms());
@@ -1049,21 +1209,27 @@ pub fn sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
                 s.last_result = Some(st);
             });
         }
+        Ok(_) => {}
         Err(e) => {
             let e = e.clone();
             update(|s| s.last_error = Some(e));
         }
     }
+    drop(guard);
     progress(app, "Done", 0, 0, "");
     result
 }
 
 fn run_sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
-    progress(app, "Backing up this PC", 0, 0, "");
-    // The local copy first, so the newest chats are the ones uploaded. "Already running" is fine: it is being done.
-    let _ = crate::sync::backup(app);
+    let backup = if restore {
+        crate::sync::SyncStats::default()
+    } else {
+        progress(app, "Backing up this PC", 0, 0, "");
+        crate::sync::backup(app)?
+    };
+    let mut stats = Stats { backed_up: backup.copied, failed: backup.failed, ..Default::default() };
     if cancelled() {
-        return Ok(Stats { cancelled: true, ..Default::default() });
+        return Ok(Stats { cancelled: true, ..stats });
     }
     let root = backup_root().ok_or("No backup folder.")?;
     fs::create_dir_all(&root).map_err(|_| "Could not create the backup folder.")?;
@@ -1071,33 +1237,27 @@ fn run_sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
     // Keep the device id from the first load for good.
     update(|s| s.device_id = me.clone());
 
-    progress(app, "Checking Google Drive", 0, 0, "");
+    if cached_listing().is_none() {
+        progress(app, "Checking Google Drive", 0, 0, "");
+    }
     let all = match list_all() {
         Ok(a) => a,
-        Err(_) if cancelled() => return Ok(Stats { cancelled: true, ..Default::default() }),
+        Err(_) if cancelled() => return Ok(Stats { cancelled: true, ..stats }),
         Err(e) => return Err(e),
     };
     let remote: Vec<Remote> = all.iter().filter_map(remote_of).collect();
-    let mut stats = Stats::default();
     let mut state = load();
 
     // 1. Upload what changed on this PC.
     let mine: HashMap<&str, &Remote> = remote.iter().filter(|r| r.device == me).map(|r| (r.rel.as_str(), r)).collect();
     let local = local_files(&root);
-    let todo: Vec<_> = local
-        .iter()
-        .filter(|(rel, _, size, mtime)| {
-            let in_drive = mine.get(rel.as_str()).is_some_and(|r| r.size == *size && r.mtime == *mtime);
-            // A file that came from another PC and was not changed here is already in Drive under that PC.
-            let from_elsewhere = state.synced.get(rel) == Some(&(*size, *mtime)) && !mine.contains_key(rel.as_str());
-            // Its Drive copy was deleted on purpose from the Backups tab, and it has not changed since.
-            let removed = state.skip_upload.get(rel) == Some(&(*size, *mtime));
-            !(in_drive || from_elsewhere || removed)
-        })
-        .collect();
+    let remote_versions = remote_versions(&remote);
+    let todo: Vec<_> = local.iter().filter(|(rel, _, size, mtime)| {
+        !restore && needs_upload(&remote_versions, rel, *size, *mtime)
+    }).collect();
     stats.unchanged = local.len() - todo.len();
     let items: Vec<(String, PathBuf, i64, i64)> = todo.iter().map(|t| (*t).clone()).collect();
-    let up = upload_many(app, &items, &mine, &me);
+    let up = upload_many(app, &items, &mine, &me, None);
     for (i, n) in &up.done {
         let (rel, _, size, mtime) = &items[*i];
         stats.uploaded += 1;
@@ -1117,10 +1277,14 @@ fn run_sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
 
     // 2. Download what the other PCs (or this PC before a reinstall) have that is newer or missing here.
     let mut best: HashMap<&str, &Remote> = HashMap::new();
-    for r in remote.iter().filter(|r| r.device != me || !root.join(safe_rel(&r.rel).unwrap_or_default()).exists()) {
+    for r in &remote {
+        let Some(rel) = safe_rel(&r.rel) else { continue };
+        if r.device == me && root.join(rel).exists() {
+            continue;
+        }
         let better = match best.get(r.rel.as_str()) {
             None => true,
-            Some(b) => (r.size, r.mtime) > (b.size, b.mtime),
+            Some(b) => (r.mtime, r.size, &r.id) > (b.mtime, b.size, &b.id),
         };
         if better {
             best.insert(r.rel.as_str(), r);
@@ -1129,7 +1293,11 @@ fn run_sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
     let names = device_names(&all);
     let candidates: Vec<&Remote> = best
         .into_values()
-        .filter(|r| state.applied.get(&r.rel) != Some(&r.version()) && state.skip_download.get(&r.rel) != Some(&r.version()))
+        .filter(|r| {
+            let missing = safe_rel(&r.rel).is_some_and(|p| !root.join(p).exists());
+            (missing || state.applied.get(&r.rel) != Some(&r.version()))
+                && ((restore && missing) || state.skip_download.get(&r.rel) != Some(&r.version()))
+        })
         .collect();
     for (i, r) in candidates.iter().enumerate() {
         if cancelled() {
@@ -1200,7 +1368,11 @@ fn run_sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
     save_merge(&state);
 
     // 3. This PC's entry in the list of PCs, and the list itself for the dialog.
-    publish_device(&all, &me, local.len());
+    if !restore && !stats.cancelled && (!items.is_empty() || !device_names(&all).contains_key(&me)
+        || load().last_sync_ms.is_none_or(|last| now_ms() - last >= 8 * 60 * 1000))
+    {
+        publish_device(&all, &me, local.len());
+    }
     let mut devices: Vec<Device> = Vec::new();
     for v in &all {
         if v["appProperties"]["cv"].as_str() == Some("dev") {
@@ -1232,7 +1404,9 @@ fn run_sync(app: &AppHandle, restore: bool) -> Result<Stats, String> {
     }
     if restore {
         progress(app, "Restoring into the tools", 0, 0, "");
-        stats.restored = crate::sync::restore(app).map(|r| r.copied).unwrap_or(0);
+        let restored = crate::sync::restore(app)?;
+        stats.restored = restored.copied;
+        stats.failed += restored.failed;
         // Stopped while copying into the tools: what was copied stays, the rest is copied next time.
         stats.cancelled = cancelled();
     }
@@ -1252,29 +1426,57 @@ struct Uploaded {
 }
 
 /// Uploads the files with several workers. The list order, progress and the first fatal error are all kept.
-fn upload_many(app: &AppHandle, items: &[(String, PathBuf, i64, i64)], mine: &HashMap<&str, &Remote>, me: &str) -> Uploaded {
+fn upload_many(
+    app: &AppHandle, items: &[(String, PathBuf, i64, i64)], mine: &HashMap<&str, &Remote>, me: &str,
+    job: Option<(&str, &AtomicBool)>,
+) -> Uploaded {
     use std::sync::atomic::AtomicUsize;
+    let is_stopped = || job.map_or_else(cancelled, |(_, stop)| stop.load(Ordering::Acquire));
+    let report = |done, total, current: &str| {
+        if let Some((id, _)) = job {
+            let _ = app.emit("backup-upload-progress", json!({ "id": id, "done": done, "total": total }));
+        } else {
+            progress(app, "Uploading", done, total, current);
+        }
+    };
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let out = Mutex::new(Uploaded { done: Vec::new(), failed: 0, fatal: None });
+    if let Some((rel, ..)) = items.first() {
+        report(0, items.len(), rel);
+    }
     std::thread::scope(|scope| {
         for _ in 0..UPLOAD_WORKERS.min(items.len().max(1)) {
             scope.spawn(|| loop {
-                if stop.load(Ordering::SeqCst) || cancelled() {
+                if stop.load(Ordering::SeqCst) || is_stopped() {
                     break;
                 }
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 let Some((rel, path, size, mtime)) = items.get(i) else { break };
-                let res = upload(mine.get(rel.as_str()).map(|r| r.id.as_str()), rel, me, path, *size, *mtime);
+                let existing = mine.get(rel.as_str()).map(|r| r.id.as_str());
+                let res = upload_cancellable(existing, rel, me, path, *size, *mtime, &is_stopped);
                 let n = finished.fetch_add(1, Ordering::SeqCst) + 1;
                 if n % 5 == 0 || n == items.len() {
-                    progress(app, "Uploading", n, items.len(), rel);
+                    report(n, items.len(), rel);
                 }
                 let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
                 match res {
-                    Ok((bytes, _)) => {
-                        RUN_DONE.fetch_add(1, Ordering::SeqCst);
+                    Ok((bytes, created)) => {
+                        if let Some(id) = created.as_deref().or(existing) {
+                            update_listing(json!({
+                                "id": id,
+                                "name": rel,
+                                "size": bytes.to_string(),
+                                "appProperties": {
+                                    "cv": "1", "dev": me, "sz": size.to_string(),
+                                    "mt": mtime.to_string(), "z": if upload_compressed(rel) { "1" } else { "0" }
+                                }
+                            }));
+                        } else {
+                            invalidate_listing();
+                        }
+                        if job.is_none() { RUN_DONE.fetch_add(1, Ordering::SeqCst); }
                         o.done.push((i, bytes));
                     }
                     Err(e) if e == "cancelled" => stop.store(true, Ordering::SeqCst),
@@ -1294,12 +1496,10 @@ fn upload_many(app: &AppHandle, items: &[(String, PathBuf, i64, i64)], mine: &Ha
 fn save_merge(work: &State) {
     let synced = work.synced.clone();
     let applied = work.applied.clone();
-    let skip_upload = work.skip_upload.clone();
     let skip_download = work.skip_download.clone();
     update(|s| {
         s.synced = synced;
         s.applied = applied;
-        s.skip_upload = skip_upload;
         s.skip_download = skip_download;
     });
 }
@@ -1316,13 +1516,28 @@ fn publish_device(all: &[Value], me: &str, files: usize) {
     let existing = all.iter().find(|v| v["appProperties"]["cv"].as_str() == Some("dev") && v["appProperties"]["dev"].as_str() == Some(me)).and_then(|v| v["id"].as_str());
     let pc: String = this_pc_name().chars().take(60).collect();
     let props = json!({ "cv": "dev", "dev": me, "pc": pc, "at": now_ms().to_string(), "n": files.to_string() });
-    let _ = send(|_| {
+    let result = metadata_request(false, || {
         let c = hc();
         match existing {
-            Some(id) => c.patch(format!("{FILES_URL}/{id}")).json(&json!({ "appProperties": props })),
-            None => c.post(FILES_URL).json(&json!({ "name": format!("device-{me}.json"), "parents": ["appDataFolder"], "mimeType": "application/json", "appProperties": props })),
+            Some(id) => c.patch(format!("{FILES_URL}/{id}")),
+            None => c.post(FILES_URL),
         }
-    });
+        .query(&[("fields", "id,name,size,appProperties")])
+        .json(&match existing {
+            Some(_) => json!({ "appProperties": props }),
+            None => json!({ "name": format!("device-{me}.json"), "parents": ["appDataFolder"], "mimeType": "application/json", "appProperties": props }),
+        })
+    }).and_then(|response| response.json::<Value>().map_err(|e| net_err(&e)));
+    if let Ok(value) = result {
+        update_listing(value);
+    }
+}
+
+fn update_listing(value: Value) {
+    if let Some((_, all)) = LIST_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        all.retain(|v| v["id"] != value["id"]);
+        all.push(value);
+    }
 }
 
 // ---------------------------------------------------------------- the Backups tab
@@ -1338,96 +1553,22 @@ pub(crate) fn remote_snapshot() -> Result<(Vec<Remote>, HashMap<String, String>)
     Ok((all.iter().filter_map(remote_of).collect(), device_names(&all)))
 }
 
-/// This PC's id, as written on its Drive files.
-pub(crate) fn this_device() -> String {
-    load().device_id
-}
-
-/// The PCs that have a backup in Drive: id → (name, time of its last sync), from each PC's small device file.
-pub(crate) fn device_files(all: &[Value]) -> HashMap<String, (String, Option<i64>, String)> {
-    all.iter()
-        .filter(|v| v["appProperties"]["cv"].as_str() == Some("dev"))
-        .filter_map(|v| {
-            let p = &v["appProperties"];
-            Some((p["dev"].as_str()?.to_string(), (p["pc"].as_str().unwrap_or("A PC").to_string(), p["at"].as_str().and_then(|s| s.parse().ok()), v["id"].as_str()?.to_string())))
-        })
-        .collect()
-}
-
-/// Everything in Drive, raw: for the list of backups (files and the PCs' device files).
-pub(crate) fn drive_listing() -> Result<Vec<Value>, String> {
-    list_all()
-}
-
-pub(crate) fn remote_of_pub(v: &Value) -> Option<Remote> {
-    remote_of(v)
-}
-
-/// Files deliberately left out of the sync: (not uploaded again: path → size, mtime; not downloaded again: path → version).
-pub(crate) fn skips() -> (HashMap<String, (i64, i64)>, HashMap<String, String>) {
-    let s = load();
-    (s.skip_upload, s.skip_download)
-}
-
-/// Whether a Drive job (sync, transfer, delete) is running now.
-pub(crate) fn busy() -> bool {
-    BUSY.load(Ordering::SeqCst)
-}
-
-/// Deletes one PC's whole backup from Drive (its files and its device file). When it is this PC's, the files here
-/// are remembered so the automatic sync does not upload them again until they change.
-pub(crate) fn delete_device(device: &str) -> Result<usize, String> {
-    if !connected() {
-        return Err("Google Drive is not connected.".into());
-    }
-    exclusive(|| {
-        let all = list_all()?;
-        let me = load().device_id;
-        let devices = device_files(&all);
-        let mut state = load();
-        let root = backup_root();
-        let mut n = 0;
-        for r in all.iter().filter_map(remote_of).filter(|r| r.device == device) {
-            delete_remote(&r.id)?;
-            n += 1;
-            state.applied.remove(&r.rel);
-            if device == me {
-                state.synced.remove(&r.rel);
-                if let (Some(root), Some(p)) = (&root, safe_rel(&r.rel)) {
-                    if let Ok(m) = fs::metadata(root.join(&p)) {
-                        let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0);
-                        state.skip_upload.insert(r.rel.clone(), (m.len() as i64, mtime));
-                    }
-                }
-            }
-        }
-        if let Some((_, _, id)) = devices.get(device) {
-            let _ = delete_remote(id);
-        }
-        save_merge(&state);
-        update(|s| s.devices.retain(|d| d.id != device));
-        Ok(n)
-    })
-}
-
 /// Runs `f` as the one Drive job at a time (a sync, a delete or a transfer never overlap).
 pub(crate) fn exclusive<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    if BUSY.swap(true, Ordering::SeqCst) {
-        return Err("A Google Drive sync is already running. Try again when it finishes.".into());
+    let _guard = drive_guard(None)?;
+    f()
+}
+
+pub(crate) fn scoped<T>(units: &HashSet<Unit>, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if units.is_empty() {
+        return Err("Choose at least one backup entry.".into());
     }
-    let r = f();
-    CANCEL_SYNC.store(false, Ordering::SeqCst);
-    BUSY.store(false, Ordering::SeqCst);
-    r
+    let _guard = drive_guard(Some(units))?;
+    f()
 }
 
 fn delete_remote(id: &str) -> Result<(), String> {
-    match send(|_| hc().delete(format!("{FILES_URL}/{id}"))) {
-        Ok(_) => Ok(()),
-        // Already gone: that is what was asked for.
-        Err(e) if e.contains("not found") => Ok(()),
-        Err(e) => Err(e),
-    }
+    metadata_request(true, || hc().delete(format!("{FILES_URL}/{id}"))).map(|_| ())
 }
 
 /// What a delete from the Backups tab removed.
@@ -1437,43 +1578,153 @@ pub struct Removed {
     pub local_files: usize,
     pub drive_files: usize,
     pub failed: usize,
+    pub error: Option<String>,
+    pub stopped: bool,
+    pub remaining: Vec<String>,
 }
 
-/// Deletes the Drive copies (from every PC) of the given backup entries, and remembers that this PC must not upload
-/// them again while they are unchanged.
-pub(crate) fn delete_drive(units: &HashSet<(String, String)>) -> Result<usize, String> {
-    let root = backup_root().ok_or("No backup folder.")?;
+/// Deletes the selected Drive copies. An unchanged copy still on this PC can be uploaded again.
+pub(crate) fn delete_drive(
+    units: &HashSet<(String, String)>,
+    out: &mut Removed,
+    stop: &AtomicBool,
+    retry: Option<&HashSet<String>>,
+    report: impl Fn(usize, usize) + Sync,
+) -> Result<(), String> {
     let (remote, _) = remote_snapshot()?;
-    let mut state = load();
-    let mut n = 0;
-    for r in remote.iter().filter(|r| crate::backups::unit_of(&r.rel).is_some_and(|u| units.contains(&u))) {
-        delete_remote(&r.id)?;
-        n += 1;
-        if let Some(p) = safe_rel(&r.rel) {
-            if let Ok(m) = fs::metadata(root.join(&p)) {
-                let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0);
-                state.skip_upload.insert(r.rel.clone(), (m.len() as i64, mtime));
-            }
-        }
-        state.synced.remove(&r.rel);
-        state.applied.remove(&r.rel);
+    let targets: Vec<_> = remote.into_iter().filter(|r| {
+        retry.is_none_or(|ids| ids.contains(&r.id))
+            && crate::backups::unit_of(&r.rel).is_some_and(|u| units.contains(&u))
+    }).collect();
+    let (deleted, error) = delete_parallel(&targets, stop, |r| delete_remote(&r.id), report);
+    let mut ids = HashSet::new();
+    for i in deleted {
+        let r = &targets[i];
+        ids.insert(r.id.as_str());
     }
-    save_merge(&state);
-    Ok(n)
+    out.drive_files = ids.len();
+    out.remaining = targets.iter().filter(|r| !ids.contains(r.id.as_str())).map(|r| r.id.clone()).collect();
+    out.stopped = stop.load(Ordering::Acquire);
+    out.error = error;
+    if !ids.is_empty() {
+        if let Some((_, all)) = LIST_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            all.retain(|v| !v["id"].as_str().is_some_and(|id| ids.contains(id)));
+        }
+        update(|s| {
+            for r in targets.iter().filter(|r| ids.contains(r.id.as_str())) {
+                s.synced.remove(&r.rel);
+                s.applied.remove(&r.rel);
+            }
+            s.last_result = None;
+        });
+    }
+    Ok(())
+}
+
+fn delete_parallel<T: Sync>(
+    targets: &[T],
+    stop: &AtomicBool,
+    delete: impl Fn(&T) -> Result<(), String> + Sync,
+    report: impl Fn(usize, usize) + Sync,
+) -> (Vec<usize>, Option<String>) {
+    use std::sync::atomic::AtomicUsize;
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let result = Mutex::new((Vec::new(), None));
+    report(0, targets.len());
+    std::thread::scope(|scope| {
+        for _ in 0..UPLOAD_WORKERS.min(targets.len()) {
+            scope.spawn(|| loop {
+                if stop.load(Ordering::Acquire) || failed.load(Ordering::Acquire) {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(target) = targets.get(i) else { break };
+                let attempt = delete(target);
+                let mut result = result.lock().unwrap_or_else(|e| e.into_inner());
+                match attempt {
+                    Ok(()) => {
+                        result.0.push(i);
+                        report(result.0.len(), targets.len());
+                    }
+                    Err(error) => {
+                        failed.store(true, Ordering::Release);
+                        result.1.get_or_insert(error);
+                    }
+                }
+            });
+        }
+    });
+    result.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+fn forget_remote_id(id: &str) {
+    if let Some((_, all)) = LIST_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        all.retain(|v| v["id"].as_str() != Some(id));
+    }
 }
 
 /// After local copies were deleted: do not download the Drive versions that are there now.
 pub(crate) fn forget_local(rels: &[String]) {
-    let known: HashMap<String, String> = if connected() { remote_snapshot().map(|(r, _)| r.into_iter().map(|x| (x.rel.clone(), x.version())).collect()).unwrap_or_default() } else { HashMap::new() };
+    let mut best: HashMap<String, Remote> = HashMap::new();
+    let cached = LIST_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, all)| all.clone());
+    for r in cached.unwrap_or_default().iter().filter_map(remote_of) {
+        if best.get(&r.rel).is_none_or(|previous| (r.mtime, r.size, &r.id) > (previous.mtime, previous.size, &previous.id)) {
+            best.insert(r.rel.clone(), r);
+        }
+    }
     update(|s| {
         for rel in rels {
             s.synced.remove(rel);
             s.applied.remove(rel);
-            if let Some(v) = known.get(rel) {
-                s.skip_download.insert(rel.clone(), v.clone());
+            if let Some(r) = best.get(rel) {
+                s.skip_download.insert(rel.clone(), r.version());
             }
         }
     });
+}
+
+pub fn selected_upload(
+    app: &AppHandle, units: &HashSet<Unit>, id: &str, stop: &AtomicBool, scope: &str,
+) -> Result<Stats, String> {
+    scoped(units, || {
+        validate_scope(scope)?;
+        let _ = app.emit("backup-upload-progress", json!({ "id": id, "done": 0, "total": 0 }));
+        let root = backup_root().ok_or("No backup folder.")?;
+        let me = update(|_| {}).device_id;
+        let remote = list_remote()?;
+        let mine: HashMap<_, _> = remote.iter().filter(|r| r.device == me).map(|r| (r.rel.as_str(), r)).collect();
+        let versions = remote_versions(&remote);
+        let mut unchanged = 0;
+        let todo: Vec<_> = local_files(&root).into_iter().filter(|(rel, _, size, mtime)| {
+            if !crate::backups::unit_of(rel).is_some_and(|unit| units.contains(&unit)) {
+                return false;
+            }
+            if needs_upload(&versions, rel, *size, *mtime) {
+                return true;
+            }
+            unchanged += 1;
+            false
+        }).collect();
+        let uploads = upload_many(app, &todo, &mine, &me, Some((id, stop)));
+        if !uploads.done.is_empty() {
+            update(|state| {
+                for (i, _) in &uploads.done {
+                    let (rel, _, size, mtime) = &todo[*i];
+                    state.synced.insert(rel.clone(), (*size, *mtime));
+                }
+            });
+        }
+        if let Some(error) = uploads.fatal {
+            return Err(error);
+        }
+        Ok(Stats {
+            uploaded: uploads.done.len(), bytes_up: uploads.done.iter().map(|(_, n)| n).sum(),
+            unchanged, failed: uploads.failed, cancelled: stop.load(Ordering::Acquire),
+            ..Default::default()
+        })
+    })
 }
 
 /// Uploads (`up`) or downloads the files of the given backup entries, for the Backups tab. A file that differs on
@@ -1495,15 +1746,15 @@ pub fn transfer(app: &AppHandle, units: &HashSet<(String, String)>, up: bool) ->
         if up {
             let mine: HashMap<&str, &Remote> = remote.iter().filter(|r| r.device == me).map(|r| (r.rel.as_str(), r)).collect();
             let all_here: Vec<_> = local_files(&root).into_iter().filter(|(rel, ..)| inside(rel)).collect();
-            let todo: Vec<_> = all_here.iter().filter(|(rel, _, size, mtime)| !mine.get(rel.as_str()).is_some_and(|r| r.size == *size && r.mtime == *mtime)).cloned().collect();
+            let versions = remote_versions(&remote);
+            let todo: Vec<_> = all_here.iter().filter(|(rel, _, size, mtime)| needs_upload(&versions, rel, *size, *mtime)).cloned().collect();
             stats.unchanged += all_here.len() - todo.len();
-            let up = upload_many(app, &todo, &mine, &me);
+            let up = upload_many(app, &todo, &mine, &me, None);
             for (i, n) in &up.done {
                 let (rel, _, size, mtime) = &todo[*i];
                 stats.uploaded += 1;
                 stats.bytes_up += n;
                 state.synced.insert(rel.clone(), (*size, *mtime));
-                state.skip_upload.remove(rel);
             }
             stats.failed += up.failed;
             if cancelled() {
@@ -1519,7 +1770,7 @@ pub fn transfer(app: &AppHandle, units: &HashSet<(String, String)>, up: bool) ->
         } else {
             let mut best: HashMap<&str, &Remote> = HashMap::new();
             for r in remote.iter().filter(|r| inside(&r.rel)) {
-                if best.get(r.rel.as_str()).is_none_or(|b| (r.size, r.mtime) > (b.size, b.mtime)) {
+                if best.get(r.rel.as_str()).is_none_or(|b| (r.mtime, r.size, &r.id) > (b.mtime, b.size, &b.id)) {
                     best.insert(r.rel.as_str(), r);
                 }
             }
@@ -1583,6 +1834,46 @@ pub fn transfer(app: &AppHandle, units: &HashSet<(String, String)>, up: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_delete_finishes_all_296_targets_and_limits_concurrency() {
+        use std::sync::atomic::AtomicUsize;
+        let targets: Vec<_> = (0..296).collect();
+        let stop = AtomicBool::new(false);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let (deleted, error) = delete_parallel(&targets, &stop, |_| {
+            let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(2));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }, |_, _| {});
+        assert!(error.is_none());
+        assert_eq!(deleted.into_iter().collect::<HashSet<_>>().len(), targets.len());
+        assert!((2..=UPLOAD_WORKERS).contains(&peak.load(Ordering::SeqCst)));
+    }
+
+    #[test]
+    fn stopping_or_failing_preserves_the_unprocessed_targets() {
+        let targets: Vec<_> = (0..296).collect();
+        let stop = AtomicBool::new(false);
+        let (deleted, error) = delete_parallel(&targets, &stop, |_| Ok(()), |done, _| {
+            if done == 12 {
+                stop.store(true, Ordering::Release);
+            }
+        });
+        assert!(error.is_none());
+        assert!((12..12 + UPLOAD_WORKERS).contains(&deleted.len()));
+
+        let stop = AtomicBool::new(false);
+        let (deleted, error) = delete_parallel(&targets, &stop, |i| {
+            if *i == 12 { Err("Drive refused a request".into()) } else { Ok(()) }
+        }, |_, _| {});
+        assert_eq!(error.as_deref(), Some("Drive refused a request"));
+        assert!(!deleted.contains(&12));
+        assert!(deleted.len() < targets.len() - 1);
+    }
 
     /// A real round trip against the signed-in Google Drive, with throwaway files written under a device id of their own
     /// ("selftest-device"), so nothing of the user's is read, changed or deleted. Run by hand:
@@ -1663,6 +1954,13 @@ mod tests {
             let local: HashMap<String, (i64, i64)> = [(chat_rel, &chat), (pic_rel, &pic), (big_rel, &big)].iter().map(|(rel, p)| (rel.to_string(), meta(p))).collect();
             let remote: HashMap<String, (i64, i64)> = mine.iter().map(|r| (r.rel.clone(), (r.size, r.mtime))).collect();
             assert_eq!(crate::backups::status_of(&local, &remote, true), "synced");
+            let versions = remote_versions(&all);
+            for (rel, (size, mtime)) in &local {
+                assert!(!needs_upload(&versions, rel, *size, *mtime), "unchanged files are skipped");
+                assert!(needs_upload(&versions, rel, *size + 1, *mtime), "changed content is uploaded");
+                assert!(needs_upload(&versions, rel, *size, *mtime + 1), "same-size edits are uploaded");
+            }
+
             assert_eq!(crate::backups::unit_of(chat_rel), crate::backups::unit_of(big_rel), "the chat and its pictures are one entry");
 
             // 4. Downloads: small file, and the big one after a "closed in the middle" (first half already on disk).
@@ -1675,18 +1973,28 @@ mod tests {
             assert_eq!(download(big_remote).expect("resumed download"), big_bytes, "the rest was fetched and joined to what was on disk");
             assert!(!part.exists(), "the temporary file is removed when the download is done");
 
-            // 5. Delete from Drive (what "Delete from Google Drive" does) and check nothing of the test is left.
-            for r in &mine {
-                delete_remote(&r.id).expect("delete");
-            }
-            created.clear();
-            let left = remote_snapshot().expect("list").0.into_iter().filter(|r| r.device == DEV).count();
-            assert_eq!(left, 0, "everything the test uploaded is gone");
-            println!("live round trip OK: 3 uploads (1 resumed), synced status, 2 downloads (1 resumed), deletes");
+            // 5. Delete through the same handler as the Backups tab, then re-upload the retained copy.
+            assert!(all.iter().filter(|r| crate::backups::unit_of(&r.rel) == crate::backups::unit_of(chat_rel)).all(|r| r.device == DEV));
+            let units = HashSet::from([crate::backups::unit_of(chat_rel).unwrap()]);
+            let mut removed = Removed::default();
+            exclusive(|| delete_drive(&units, &mut removed, &AtomicBool::new(false), None, |_, _| {})).expect("delete the test chat from Drive");
+            assert_eq!(removed.drive_files, 3);
+            assert!(removed.error.is_none());
+            let remaining = remote_snapshot().expect("list after delete").0;
+            let (size, mtime) = meta(&chat);
+            assert!(needs_upload(&remote_versions(&remaining), chat_rel, size, mtime));
+            let (_, id) = upload(None, chat_rel, DEV, &chat, size, mtime).expect("re-upload");
+            created.push(id.expect("re-upload returns its id"));
+            refresh_listing();
+            let after = remote_snapshot().expect("list after re-upload").0;
+            assert!(!needs_upload(&remote_versions(&after), chat_rel, size, mtime));
+            println!("Live Drive upload, unchanged skip, download, chat deletion, and re-upload passed.");
         }));
         // Always clean up, even if a check failed: remove whatever the test created in Drive, and its local files.
         for id in &created {
-            let _ = delete_remote(id);
+            if delete_remote(id).is_ok() {
+                forget_remote_id(id);
+            }
         }
         let leftovers = remote_snapshot().map(|(r, _)| r.into_iter().filter(|r| r.device == DEV).collect::<Vec<_>>()).unwrap_or_default();
         for r in leftovers {

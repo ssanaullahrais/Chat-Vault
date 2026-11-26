@@ -3,6 +3,21 @@
 What changed in each version of ChatVault. The newest version is at the top. Downloads are on the
 [Releases page](https://github.com/ssanaullahrais/Chat-Vault/releases).
 
+## [0.6.1] - 2026-11-27
+
+### Backups and Google Drive
+
+- Browse one list of backed-up chats with a chip for each location and a status for the chat. Search, filter, and apply actions to multiple chats from the same view.
+- Open Backups while ChatVault refreshes the inventory in the background. Drive sync uploads new or changed chats and can upload a deleted Drive copy again when the chat is still available locally.
+- Run uploads and Drive deletions in the background, including multiple jobs on different chats. See progress in the Drive activity panel and on affected backup rows. Interrupted uploads resume when ChatVault reopens.
+- Restore missing chats without overwriting existing chats. The title bar shows Drive connection and sync status, and the sign-in confirmation uses the ChatVault logo.
+
+### Chat transcripts
+
+- Browse screenshots, file attachments, and saved tool output across Claude Code, Codex, Cursor, Gemini CLI, OpenCode, and Cline. Multiple screenshots appear as thumbnails, and available local attachments open in the shared file viewer.
+- Long user inputs show a five-line preview and a full-text dialog with Copy and Save as Markdown. Codex pasted files appear as individual clickable attachments, with the request text displayed separately.
+- Inline AI screenshot previews trim large white margins. Full-screen viewing, copying, and downloading use the original image.
+
 ## [0.5.1] - 2026-11-25
 
 ### Release fixes

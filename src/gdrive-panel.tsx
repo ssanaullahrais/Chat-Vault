@@ -1,3 +1,6 @@
+import { driveJobActive, resumeDriveJobs, startDriveJob, useDriveJobs } from "@/drive-jobs";
+import { describeDriveSync, type DriveStats } from "@/drive-stats";
+import { BACKUP_AUTO_ENABLED, backupChanges, invalidateBackups } from "@/backup-refresh";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -7,9 +10,8 @@ import { confirmAction } from "@/components/confirm";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
-import { fmtDate, fmtSize } from "@/chat-actions";
+import { fmtDate } from "@/chat-actions";
 import { PanelHeader } from "@/rail";
 import { notifyError } from "@/toast";
 import { LegalDialog, type LegalDoc } from "@/legal";
@@ -20,7 +22,6 @@ export function DriveLogo({ className }: { className?: string }) {
   return <img src={driveLogo} alt="" aria-hidden="true" draggable={false} className={className} />;
 }
 
-export type DriveStats = { uploaded: number; downloaded: number; conflicts: number; failed: number; unchanged: number; bytesUp: number; bytesDown: number; restored: number; cancelled: boolean };
 export type DriveDevice = { id: string; name: string; lastSyncMs: number | null; files: number; thisPc: boolean };
 export type DriveStatus = {
   available: boolean;
@@ -39,7 +40,7 @@ export type DriveStatus = {
   cancelling: boolean;
   devices: DriveDevice[];
 };
-type Prog = { phase: string; done: number; total: number; current: string };
+
 
 const SETUP_GUIDE = "https://github.com/ssanaullahrais/Chat-Vault/blob/main/docs/GOOGLE_DRIVE_SETUP.md";
 
@@ -57,77 +58,32 @@ function GoogleButton({ busy, disabled, onClick }: { busy: boolean; disabled: bo
   );
 }
 
-const plural = (n: number) => `${n.toLocaleString()} ${n === 1 ? "file" : "files"}`;
-
-/** One line about what the last sync did. */
-export function describeDriveSync(s: DriveStats) {
-  if (s.cancelled) {
-    return s.uploaded ? `Sync paused after ${plural(s.uploaded)}. The next sync carries on from there.` : "Sync paused. The next sync carries on from there.";
-  }
-  const parts: string[] = [];
-  if (s.uploaded) parts.push(`uploaded ${s.uploaded.toLocaleString()} ${s.uploaded === 1 ? "file" : "files"} (${fmtSize(s.bytesUp)})`);
-  if (s.downloaded) parts.push(`downloaded ${s.downloaded.toLocaleString()} (${fmtSize(s.bytesDown)})`);
-  if (s.restored) parts.push(`restored ${s.restored.toLocaleString()} into the tools`);
-  if (!parts.length) parts.push("everything was already up to date");
-  let text = parts.join(", ");
-  text = text.charAt(0).toUpperCase() + text.slice(1) + ".";
-  if (s.conflicts) text += ` ${s.conflicts} ${s.conflicts === 1 ? "chat was" : "chats were"} changed on two PCs, so both copies were kept.`;
-  if (s.failed) text += ` ${s.failed} could not be synced and will be tried again next time.`;
-  return text;
-}
-
 /** The Google Drive tab of Sync & backup: connect, sync, restore, the PCs that share the account, and disconnect. */
 export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () => void; toast: (m: string) => void; onBusy: (busy: boolean) => void }) {
+  const jobs = useDriveJobs();
+  const active = jobs.some(driveJobActive);
+  const syncJob = jobs.find((job) => job.request.kind === "sync" && driveJobActive(job));
+  const restoreJob = jobs.find((job) => job.request.kind === "restore" && driveJobActive(job));
   const [st, setSt] = useState<DriveStatus | null>(null);
-  const [working, setWorking] = useState<"connect" | "sync" | "restore" | "disconnect" | null>(null);
-  const [prog, setProg] = useState<Prog | null>(null);
+  const [working, setWorking] = useState<"connect" | "disconnect" | null>(null);
   const [confirmOut, setConfirmOut] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
   const [legal, setLegal] = useState<LegalDoc | null>(null);
-  const [confirmCancel, setConfirmCancel] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
-  // From the moment you confirm until the sync has really stopped, the button says so (stopping can take a moment: a
-  // piece being sent has to finish first).
-  const [stopRequested, setStopRequested] = useState(false);
-
   const load = useCallback(() => {
     invoke<DriveStatus>("gdrive_status").then(setSt).catch(() => {});
   }, []);
   useEffect(() => {
     load();
-    // Then ask Google whether the connection still works (the access may have been removed in the Google account).
-    invoke<DriveStatus>("gdrive_check").then(setSt).catch(() => {});
-    const un = listen<Prog>("gdrive-progress", (e) => setProg(e.payload.phase === "Done" ? null : e.payload));
+    const off = backupChanges(load);
+    const un = listen<{ phase: string }>("gdrive-progress", (e) => {
+      if (e.payload.phase === "Done") load();
+    });
     return () => {
+      off();
       void un.then((f) => f());
     };
   }, [load]);
   useEffect(() => onBusy(!!working), [working, onBusy]);
-  // While a sync runs (started here or by the automatic sync), keep the count of files it has uploaded fresh: that is what
-  // cancelling would delete again.
-  const running = !!st && (working === "sync" || working === "restore" || st.busy);
-  useEffect(() => {
-    if (!running) setStopRequested(false);
-  }, [running]);
-  useEffect(() => {
-    if (!running) return;
-    const id = window.setInterval(load, 1500);
-    return () => window.clearInterval(id);
-  }, [running, load]);
-
-  const cancelSync = async () => {
-    setCancelling(true);
-    try {
-      await invoke("gdrive_cancel_sync");
-      setStopRequested(true);
-      setConfirmCancel(false);
-      load();
-    } catch (e) {
-      notifyError(e);
-    } finally {
-      setCancelling(false);
-    }
-  };
+  useEffect(load, [active, load]);
 
   const connect = async () => {
     const ok = await confirmAction({
@@ -142,6 +98,9 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
       const s = await invoke<DriveStatus>("gdrive_connect");
       setSt(s);
       toast(s.email ? `Google Drive connected (${s.email})` : "Google Drive connected");
+      invalidateBackups({ clear: true });
+      await resumeDriveJobs(onChanged).catch(notifyError);
+      if (s.autoSync) window.dispatchEvent(new Event(BACKUP_AUTO_ENABLED));
     } catch (e) {
       notifyError(e);
     } finally {
@@ -150,27 +109,13 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
   };
 
   const sync = async (restore: boolean) => {
-    const ok = await confirmAction(
-      restore
-        ? { title: "Restore from Google Drive?", description: "The chats from your other PCs are downloaded into this PC's backup folder and copied into the tools. Nothing that is already here is overwritten.", action: "Restore", icon: <CloudDownload className="size-4 text-muted-foreground" strokeWidth={1.5} /> }
-        : { title: "Sync with Google Drive now?", description: "New and changed chats on this PC are uploaded, and the other PCs' chats are downloaded into the backup folder. Syncing never deletes anything.", action: "Sync now", icon: <CloudUpload className="size-4 text-muted-foreground" strokeWidth={1.5} /> },
-    );
-    if (!ok) return;
-    setWorking(restore ? "restore" : "sync");
-    setResult(null);
-    setProg(null);
-    try {
-      const s = await invoke<DriveStats>("gdrive_sync", { restore });
-      setResult(describeDriveSync(s));
-      toast(s.cancelled ? (restore ? "Restore stopped" : "Sync paused") : restore ? "Restored from Google Drive" : "Synced with Google Drive");
-      onChanged();
-    } catch (e) {
-      notifyError(e);
-    } finally {
-      setWorking(null);
-      setProg(null);
-      load();
-    }
+    if (restore && !await confirmAction({
+      title: "Restore missing chats from Google Drive?",
+      description: "Available backups are downloaded to this PC and missing files are copied into their tools. Existing tool files are kept.",
+      action: "Restore",
+      icon: <CloudDownload className="size-4 text-muted-foreground" strokeWidth={1.5} />,
+    })) return;
+    await startDriveJob({ kind: restore ? "restore" : "sync" }, onChanged);
   };
 
   const disconnect = async () => {
@@ -178,8 +123,8 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
     try {
       setSt(await invoke<DriveStatus>("gdrive_disconnect", { deleteBackup: false }));
       toast("Google Drive disconnected");
+      invalidateBackups({ clear: true });
       setConfirmOut(false);
-      setResult(null);
     } catch (e) {
       notifyError(e);
     } finally {
@@ -215,8 +160,10 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
     );
   }
 
-  const busy = !!working || st.busy;
-  const pct = prog && prog.total ? Math.round((prog.done / prog.total) * 100) : null;
+  const busy = active || !!working || st.busy;
+  const lastSync = st.lastResult;
+  const upToDate = !busy && !st.lastError && !!lastSync && !lastSync.failed && !lastSync.cancelled;
+  const syncMessage = !syncJob && !working && !st.lastError && lastSync && describeDriveSync(lastSync);
 
   return (
     <>
@@ -282,35 +229,22 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
             </div>
           </div>
           <div className="flex flex-wrap gap-2 border-t p-3.5">
-            {/* While a sync runs the same button cancels it, after you confirm. */}
-            {running && working !== "restore" ? (
-              <Button variant="destructive" className="min-w-40 flex-1" disabled={stopRequested || st.cancelling} onClick={() => { load(); setConfirmCancel(true); }}>
-                <Loader2 className="size-4 animate-spin" /> {stopRequested || st.cancelling ? "Cancelling…" : "Cancel sync"}
-              </Button>
-            ) : (
-              <Button className="min-w-40 flex-1" disabled={busy} onClick={() => void sync(false)}>
-                <CloudUpload className="size-4" /> Sync now
-              </Button>
-            )}
-            {/* A restore never overwrites anything, so stopping it needs no confirmation: what it copied stays. */}
-            {working === "restore" ? (
-              <Button variant="destructive" className="min-w-40 flex-1" disabled={stopRequested || st.cancelling || cancelling} onClick={() => void cancelSync()}>
-                <Loader2 className="size-4 animate-spin" /> {stopRequested || st.cancelling ? "Cancelling…" : "Cancel restore"}
-              </Button>
-            ) : (
-              <Button variant="outline" className="min-w-40 flex-1" disabled={busy} onClick={() => void sync(true)}>
-                <CloudDownload className="size-4" /> Restore from Google Drive
-              </Button>
-            )}
+            <Button
+              variant={upToDate ? "outline" : "default"}
+              className="min-w-40 flex-1"
+              disabled={!!working || !!syncJob}
+              title={upToDate ? "Check for new changes" : undefined}
+              onClick={() => void sync(false)}
+            >
+              {upToDate ? (
+                <span aria-hidden="true" className="size-2 rounded-full bg-emerald-500 motion-safe:animate-[pulse_3s_ease-in-out_infinite]" />
+              ) : <CloudUpload className="size-4" />}
+              {syncJob ? (syncJob.state === "queued" ? "Sync queued" : "Syncing in background") : upToDate ? "Up to date" : "Sync now"}
+            </Button>
+            <Button variant="outline" className="min-w-40 flex-1" disabled={!!working || !!restoreJob} onClick={() => void sync(true)}>
+              <CloudDownload className="size-4" /> {restoreJob ? "Restore in background" : "Restore from Google Drive"}
+            </Button>
           </div>
-          {(working === "sync" || working === "restore" || st.busy) && (
-            <div className="min-w-0 space-y-1.5 border-t px-3.5 py-3">
-              <Progress value={pct} />
-              <p className="truncate text-xs text-muted-foreground">
-                {prog ? `${prog.phase}${prog.total ? ` ${prog.done.toLocaleString()} of ${prog.total.toLocaleString()}` : "…"}${prog.current ? ` · ${prog.current.split("/").pop()}` : ""}` : "Getting ready…"}
-              </p>
-            </div>
-          )}
         </div>
       )}
 
@@ -320,7 +254,9 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
           <p>The last sync did not finish: {st.lastError} Your chats here are not affected, and ChatVault keeps working offline.</p>
         </div>
       )}
-      {result && !working && <p className="mt-3 rounded-lg border p-3 text-sm">{result}</p>}
+      {st.connected && <div role="status">
+        {syncMessage && <p className="mt-3 rounded-lg border p-3 text-sm">{syncMessage}</p>}
+      </div>}
 
       {st.connected && (
         <>
@@ -334,7 +270,12 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
               aria-label="Sync with Google Drive automatically"
               onCheckedChange={(v) => {
                 setSt({ ...st, autoSync: v });
-                void invoke("gdrive_set_auto", { on: v });
+                void invoke("gdrive_set_auto", { on: v }).then(() => {
+                  if (v) window.dispatchEvent(new Event(BACKUP_AUTO_ENABLED));
+                }).catch((e) => {
+                  load();
+                  notifyError(e);
+                });
               }}
             />
           </div>
@@ -374,40 +315,6 @@ export function GoogleDrivePanel({ onChanged, toast, onBusy }: { onChanged: () =
       </div>
 
       <LegalDialog doc={legal} onDoc={setLegal} onClose={() => setLegal(null)} />
-
-      <AlertDialog open={confirmCancel} onOpenChange={(o) => !cancelling && setConfirmCancel(o)}>
-        <AlertDialogContent className="sm:max-w-md">
-          <AlertDialogHeader>
-            <div className="flex items-start gap-3">
-              <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
-                <TriangleAlert className="size-4 text-destructive" strokeWidth={1.5} />
-              </div>
-              <div className="min-w-0">
-                <AlertDialogTitle className="text-base font-medium">Cancel this sync?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  {st && st.runUploaded > 0
-                    ? `ChatVault stops now. The ${plural(st.runUploaded)} already uploaded stay in your Google Drive, and the next sync carries on from there.`
-                    : "ChatVault stops now. The next sync carries on from where this one stopped."}
-                </AlertDialogDescription>
-              </div>
-            </div>
-          </AlertDialogHeader>
-
-          <AlertDialogFooter className="grid grid-cols-2 gap-2 sm:flex">
-            <AlertDialogCancel disabled={cancelling}>Keep syncing</AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              disabled={cancelling}
-              onClick={(e) => {
-                e.preventDefault();
-                void cancelSync();
-              }}
-            >
-              {cancelling && <Loader2 className="size-4 animate-spin" />} Cancel sync
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
 
       <AlertDialog open={confirmOut} onOpenChange={(o) => !working && setConfirmOut(o)}>
         <AlertDialogContent className="sm:max-w-md">
